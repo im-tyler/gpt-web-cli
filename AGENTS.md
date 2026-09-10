@@ -7,7 +7,7 @@
 - `start "prompt"` -> prints job id, returns immediately; `--file <path>` (repeatable) attaches files
 - `send <id> "text"` -> follow-up in the same conversation; `--file` works here too
 - `wait <id> [secs]` -> blocks, prints reply, exit 1 on error (default 600s); `--stream` prints as it grows
-- `list`, `status`, `chats`, `login`
+- `list`, `status`, `chats` (account threads via `/backend-api/conversations`, not CLI jobs), `login`
 - `files <chat-id>` / `download <chat-id> [n|all] [outdir]` -> conversation file artifacts
 
 ## Upload + streaming notes (v0.3)
@@ -23,18 +23,18 @@ Agent-chat files have no stable listing API (conversation endpoint 404s; `/inter
 
 ## Architecture (do not regress this)
 
-One long-lived **plain Chrome** daemon (`--remote-debugging-port=9777`, real keychain, zero automation flags) is spawned on demand; all commands drive it over CDP via playwright-core `connectOverCDP`. Login session lives inside that process.
+One long-lived **plain Chrome** daemon (`--remote-debugging-port=9777`, real keychain, zero automation flags) is spawned on demand; all commands drive it over CDP via playwright-core `connectOverCDP({ noDefaults: true })` (Chrome 152+ rejects `Browser.setDownloadBehavior` on the default profile). If `/json` has no `page` target, `PUT /json/new?about:blank` first. Login session lives inside that process.
 
 **NEVER** run Playwright `launchPersistentContext` against the profile dir (`~/.chatgpt-web/profile`). Playwright injects `--use-mock-keychain`; Chrome then cannot decrypt the session cookies written by real Chrome and silently DELETES them (destroyed a live session this way once, 2026-09-09). No UA spoofing either — it is real Chrome; spoofing breaks Cloudflare.
 
 ## Operational rules
 
-- The daemon Chrome window must stay open (minimize is fine). Cmd+Q = session home gone.
+- The daemon Chrome process must stay alive. Windowed: minimize is fine; Cmd+Q = session home gone. `CHATGPT_WEB_HEADLESS=1` does **not** pass `--headless` (Cloudflare challenges that). It spawns the same headed Chrome and hides the process via System Events (`visible=false`). Login unhides. Never spoof UA or use stealth patches.
 - One turn at a time (running-job guard; also Chrome-side reality).
 - Jobs: `~/.chatgpt-web/jobs/<id>.json` (id, status, prompt, reply, url, history, pid). Crashed runners self-heal to `error` via pid check.
 - chatgpt.com renders a logged-out SSR shell with login buttons for a few seconds after navigation — page classification must wait for settle (`classifyPage`), never judge on first paint.
 - Response completion = assistant text stable ~1.2s + no stop button.
-- Env: `CHATGPT_WEB_HOME`, `CHATGPT_WEB_TIMEOUT` (secs/turn, default 300), `CHATGPT_WEB_CDP_PORT` (default 9777), `CHATGPT_WEB_CHROME` (binary path), `CHATGPT_WEB_MAX_TURNS_DAY` (default 100), `CHATGPT_WEB_MAX_NEW_CHATS` (per hour, default 6), `CHATGPT_WEB_MIN_GAP` (secs, default 8), `CHATGPT_WEB_NOTIFY=0` disables notifications.
+- Env: `CHATGPT_WEB_HOME`, `CHATGPT_WEB_TIMEOUT` (secs/turn, default 300), `CHATGPT_WEB_CDP_PORT` (default 9777), `CHATGPT_WEB_CHROME` (binary path), `CHATGPT_WEB_HEADLESS=1` (hide headed window; never `--headless`), `CHATGPT_WEB_MAX_TURNS_DAY` (default 100), `CHATGPT_WEB_MAX_NEW_CHATS` (per hour, default 6), `CHATGPT_WEB_MIN_GAP` (secs, default 8), `CHATGPT_WEB_NOTIFY=0` disables notifications.
 
 ## Pacing + caps (flag-risk reduction, v0.2)
 
@@ -48,4 +48,4 @@ Behavioral camouflage is the priority — NOT fingerprint spoofing (real Chrome 
 
 ## State
 
-Working end-to-end 2026-09-09: login (auto-detects completion), start/send/wait (with `--file` uploads and `--stream`), chats listing, files/download (agent-chat artifacts via estuary interception), status, pacing + caps. Known limitation: Chrome auto-update restarts kill the daemon port mid-turn; next command respawns (job errors, retry).
+Working 2026-09-10: login, start/send/wait (`--file`, `--stream`), `chats` via `/backend-api/conversations` (id / async_status / updated / title), files/download, status (windowed|hidden|headless), pacing + caps. CDP: `connectOverCDP({ noDefaults: true })` + `PUT /json/new` if no page target. `CHATGPT_WEB_HEADLESS=1` hides headed Chrome (System Events `visible=false`); never `--headless` (Cloudflare). Login unhides. Hide runs before `page.goto`, so navigation can flash/focus the window; Dock icon stays. Known limitation: Chrome auto-update restarts kill the daemon port mid-turn; next command respawns (job errors, retry).

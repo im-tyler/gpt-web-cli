@@ -32,6 +32,54 @@ function chromeBinary() {
   return null
 }
 
+function wantHeadless() {
+  const v = String(process.env.CHATGPT_WEB_HEADLESS || '').toLowerCase()
+  return v === '1' || v === 'true' || v === 'yes'
+}
+
+function chromeIsHeadlessBin() {
+  try {
+    const out = execSync('pgrep -lf "user-data-dir=' + PROFILE_DIR + '"', { encoding: 'utf8' })
+    return /--headless/.test(out)
+  } catch {
+    return false
+  }
+}
+
+function daemonPid() {
+  try {
+    const out = execSync('lsof -nP -t -iTCP:' + CDP_PORT + ' -sTCP:LISTEN', { encoding: 'utf8' })
+    const n = parseInt(out.trim().split('\n')[0], 10)
+    return Number.isInteger(n) ? n : null
+  } catch {
+    return null
+  }
+}
+
+function setDaemonVisible(show) {
+  if (process.platform !== 'darwin') return
+  const pid = daemonPid()
+  if (!pid) return
+  try {
+    execSync(
+      'osascript -e \'tell application "System Events"\' -e \'set visible of (first process whose unix id is ' +
+        pid +
+        ') to ' +
+        show +
+        "' -e 'end tell'",
+      { stdio: 'ignore', timeout: 5000 }
+    )
+  } catch {}
+}
+
+async function hideDaemon() {
+  if (process.platform !== 'darwin') return
+  for (let i = 0; i < 6; i++) {
+    setDaemonVisible(false)
+    await sleep(250)
+  }
+}
+
 function profileBusy() {
   try {
     execSync('pgrep -f "user-data-dir=' + PROFILE_DIR + '"', { stdio: 'pipe' })
@@ -51,38 +99,58 @@ async function cdpAlive() {
 }
 
 async function ensureBrowser() {
-  if (await cdpAlive()) return
+  if (await cdpAlive()) {
+    if (chromeIsHeadlessBin()) {
+      throw new Error(
+        'daemon is Chrome --headless (Cloudflare-blocked) — quit it and retry; CHATGPT_WEB_HEADLESS=1 hides a headed window'
+      )
+    }
+    if (wantHeadless()) await hideDaemon()
+    return
+  }
   if (profileBusy()) {
     throw new Error('chatgpt-web Chrome is open without remote debugging — quit it (Cmd+Q) and retry')
   }
   const bin = chromeBinary()
   if (!bin) throw new Error('no Chrome binary found — set CHATGPT_WEB_CHROME=/path/to/chrome')
-  const child = spawn(
-    bin,
-    [
-      '--remote-debugging-port=' + CDP_PORT,
-      '--user-data-dir=' + PROFILE_DIR,
-      '--no-first-run',
-      '--no-default-browser-check',
-      'about:blank',
-    ],
-    { detached: true, stdio: 'ignore' }
-  )
+  const args = [
+    '--remote-debugging-port=' + CDP_PORT,
+    '--user-data-dir=' + PROFILE_DIR,
+    '--no-first-run',
+    '--no-default-browser-check',
+    'about:blank',
+  ]
+  const child = spawn(bin, args, { detached: true, stdio: 'ignore' })
   child.unref()
   const deadline = Date.now() + 20000
   while (Date.now() < deadline) {
-    if (await cdpAlive()) return
+    if (await cdpAlive()) {
+      if (wantHeadless()) await hideDaemon()
+      return
+    }
     await sleep(300)
   }
   throw new Error('chatgpt-web Chrome started but the debugging port never came up')
 }
 
+async function ensurePageTarget() {
+  let tabs = []
+  try {
+    tabs = await (await fetch(CDP_URL + '/json', { signal: AbortSignal.timeout(1500) })).json()
+  } catch {
+    return
+  }
+  if (Array.isArray(tabs) && tabs.some((t) => t.type === 'page')) return
+  await fetch(CDP_URL + '/json/new?about:blank', { method: 'PUT', signal: AbortSignal.timeout(2000) }).catch(() => {})
+}
+
 async function withPage(fn) {
-  const browser = await chromium.connectOverCDP(CDP_URL)
+  await ensurePageTarget()
+  const browser = await chromium.connectOverCDP(CDP_URL, { noDefaults: true })
   try {
     const context = browser.contexts()[0]
     if (!context) throw new Error('no default context over CDP')
-    let page = context.pages().find((p) => !p.isClosed())
+    let page = context.pages().find((p) => !p.isClosed() && !String(p.url()).startsWith('chrome://'))
     if (!page) page = await context.newPage()
     return await fn(page)
   } finally {
@@ -273,6 +341,7 @@ export async function runTurn(jobId) {
 
 export async function runLogin() {
   await ensureBrowser()
+  setDaemonVisible(true)
   console.error('chatgpt-web Chrome is open — log in to ChatGPT in its window. Waiting up to 5 minutes...')
   await withPage(async (page) => {
     await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
@@ -291,30 +360,59 @@ export async function runChats() {
   await ensureBrowser()
   await withPage(async (page) => {
     await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
-    let links = []
-    for (;;) {
-      const state = await classifyPage(page)
-      if (state === 'out') {
-        console.error('not logged in — run: chatgpt-web login')
-        process.exitCode = 1
-        return
-      }
-      if (state === 'in') {
-        links = await page.locator('nav a[href*="/c/"]').all()
-        if (links.length) break
-      }
-      if (Date.now() > deadline) break
-      await sleep(500)
+    const state = await classifyPage(page)
+    if (state === 'out') {
+      console.error('not logged in — run: chatgpt-web login')
+      process.exitCode = 1
+      return
     }
-    if (!links.length) {
+    if (state !== 'in') {
+      console.error('session unknown — run: chatgpt-web login')
+      process.exitCode = 1
+      return
+    }
+    const result = await page.evaluate(async () => {
+      const session = await fetch('/api/auth/session', { credentials: 'include' }).then((r) => r.json())
+      const token = session && session.accessToken
+      if (!token) return { error: 'no session token' }
+      const items = []
+      let offset = 0
+      const limit = 50
+      for (;;) {
+        const r = await fetch(
+          '/backend-api/conversations?offset=' + offset + '&limit=' + limit + '&order=updated',
+          {
+            credentials: 'include',
+            headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+          }
+        )
+        if (!r.ok) return { error: 'conversations http ' + r.status, items }
+        const j = await r.json()
+        const batch = j.items || []
+        items.push(...batch)
+        if (batch.length < limit || items.length >= 200) break
+        offset += limit
+      }
+      return { items }
+    })
+    const items = result.items || []
+    if (result.error && !items.length) {
+      console.error(result.error)
+      process.exitCode = 1
+      return
+    }
+    if (!items.length) {
       console.log('no chats found')
       return
     }
-    for (const l of links) {
-      const href = (await l.getAttribute('href')) || ''
-      const id = ((href.split('/c/')[1] || '').split('/')[0]).split('?')[0]
-      const title = ((await l.innerText().catch(() => '')).split('\n')[0] || '').trim()
-      console.log(id.padEnd(16), title.slice(0, 60))
+    const idW = 36
+    console.log(['ID'.padEnd(idW), 'STATUS'.padEnd(10), 'UPDATED'.padEnd(20), 'TITLE'].join(' '))
+    for (const it of items) {
+      const id = String(it.id || '')
+      const status = it.async_status || 'idle'
+      const updated = String(it.update_time || '').replace('T', ' ').slice(0, 16)
+      const title = String(it.title || '').replace(/\s+/g, ' ').slice(0, 60)
+      console.log([id.padEnd(idW), String(status).padEnd(10), updated.padEnd(20), title].join(' '))
     }
   })
 }
@@ -434,7 +532,8 @@ export async function runDownload(chatId, what, outdir) {
 
 export async function runStatus() {
   const up = await cdpAlive()
-  console.log('daemon:', up ? 'up (CDP port ' + CDP_PORT + ')' : 'down (next command starts it)')
+  const mode = !up ? '' : chromeIsHeadlessBin() ? ', headless' : wantHeadless() ? ', hidden' : ', windowed'
+  console.log('daemon:', up ? 'up (CDP port ' + CDP_PORT + mode + ')' : 'down (next command starts it)')
   const s = readState()
   const L = limits()
   const hourChats = (s.newChats || []).filter((t) => Date.now() - t < 3600000).length

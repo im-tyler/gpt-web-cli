@@ -38,18 +38,20 @@ function usage() {
                       optional: --stream prints the reply as it grows
   list                list jobs
   status              daemon, session, usage caps, running job
-  chats               list ChatGPT conversations in the profile (sidebar)
+  chats               list ChatGPT conversations (id, async status, updated, title)
   files <chat-id>     list files created in a conversation
   download <chat-id> [n|all] [outdir]
                       save conversation files to disk (default: all, current dir)
   login               open the chatgpt-web Chrome window and wait until you log in
 
 The Chrome window stays open in the background (minimize it) — it owns the
-login session and all turns run through it.
+login session and all turns run through it. CHATGPT_WEB_HEADLESS=1 hides that
+headed window (does not use Chrome --headless; Cloudflare blocks that).
 
 env: CHATGPT_WEB_HOME=${HOME}
      CHATGPT_WEB_TIMEOUT=<secs per turn, default 300>
      CHATGPT_WEB_CDP_PORT=<default 9777>
+     CHATGPT_WEB_HEADLESS=1
      CHATGPT_WEB_MAX_TURNS_DAY=<default 100>  CHATGPT_WEB_MAX_NEW_CHATS=<per hour, default 6>
      CHATGPT_WEB_MIN_GAP=<secs between turns, default 8>  CHATGPT_WEB_NOTIFY=0 disables notifications`)
 }
