@@ -66,12 +66,14 @@ export function pidAlive(pid) {
 }
 
 export function runningJob() {
-  return listJobs().find((j) => j.status === 'running' && pidAlive(j.pid)) || null
+  return (
+    listJobs().find((j) => (j.status === 'running' || j.status === 'streaming') && pidAlive(j.pid)) || null
+  )
 }
 
 export function reapStale() {
   for (const j of listJobs()) {
-    if (j.status === 'running' && !pidAlive(j.pid)) {
+    if ((j.status === 'running' || j.status === 'streaming') && !pidAlive(j.pid)) {
       j.status = 'error'
       j.error = j.pid ? `runner died (pid ${j.pid})` : 'runner never started'
       writeJob(j)

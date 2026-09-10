@@ -4,11 +4,18 @@
 
 ## Commands
 
-- `start "prompt"` -> prints job id, returns immediately
-- `send <id> "text"` -> follow-up in the same conversation
-- `wait <id> [secs]` -> blocks, prints reply, exit 1 on error (default 600s)
+- `start "prompt"` -> prints job id, returns immediately; `--file <path>` (repeatable) attaches files
+- `send <id> "text"` -> follow-up in the same conversation; `--file` works here too
+- `wait <id> [secs]` -> blocks, prints reply, exit 1 on error (default 600s); `--stream` prints as it grows
 - `list`, `status`, `chats`, `login`
 - `files <chat-id>` / `download <chat-id> [n|all] [outdir]` -> conversation file artifacts
+
+## Upload + streaming notes (v0.3)
+
+- Uploads: click `[data-testid="composer-plus-btn"]` -> popover -> `getByText(/upload from computer/i)` -> `page.waitForEvent('filechooser')` -> `setFiles`. Match by regex, NOT exact text (popover markup varies).
+- NEVER leave a pending `waitForEvent` promise unawaited after an early throw — attach a sibling `.catch(() => {})` immediately, or the delayed rejection kills the whole runner as an unhandled rejection (job reads "runner died").
+- First send on a fresh chat navigates `/` -> `/c/<id>` and the message list REMOUNTS — assistant-message count flickers 0->1->0. Response-start detection requires 2 consecutive positive sightings, never break-then-recheck.
+- Job statuses: `running` -> `streaming` (partial reply written every >=2s) -> `done`. `runningJob`/`reapStale`/send-guard all treat `streaming` as busy.
 
 ## File download notes
 
@@ -41,4 +48,4 @@ Behavioral camouflage is the priority — NOT fingerprint spoofing (real Chrome 
 
 ## State
 
-Working end-to-end 2026-09-09: login (auto-detects completion), start/send/wait, chats listing, files/download (agent-chat artifacts via estuary interception), status, pacing + caps. Known limitation: Chrome auto-update restarts kill the daemon port mid-turn; next command respawns (job errors, retry).
+Working end-to-end 2026-09-09: login (auto-detects completion), start/send/wait (with `--file` uploads and `--stream`), chats listing, files/download (agent-chat artifacts via estuary interception), status, pacing + caps. Known limitation: Chrome auto-update restarts kill the daemon port mid-turn; next command respawns (job errors, retry).

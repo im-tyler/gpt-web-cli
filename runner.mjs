@@ -146,14 +146,41 @@ async function sendPrompt(page) {
   }
 }
 
-async function waitForReply(page, before) {
+async function uploadFiles(page, paths) {
+  const fcP = page.waitForEvent('filechooser', { timeout: 12000 })
+  fcP.catch(() => {})
+  await page.locator('[data-testid="composer-plus-btn"]').click({ timeout: 5000 })
+  await sleep(jitter(600, 1200))
+  await page.getByText(/upload from computer/i).first().click({ timeout: 5000 })
+  const fc = await fcP
+  await fc.setFiles(paths.map((p) => path.resolve(p)))
+  const names = paths.map((p) => path.basename(p))
+  const deadline = Date.now() + 45000
+  while (Date.now() < deadline) {
+    const body = await page.locator('body').innerText().catch(() => '')
+    if (names.every((n) => body.includes(n))) {
+      await sleep(jitter(2000, 3000))
+      return
+    }
+    await sleep(800)
+  }
+  throw new Error('upload never completed (attach chips missing)')
+}
+
+async function waitForReply(page, before, onPartial) {
   const msgs = page.locator(ASSISTANT_SEL)
   const started = Date.now()
+  let startedStreak = 0
   while (Date.now() - started < TURN_TIMEOUT_MS) {
-    if ((await msgs.count().catch(() => 0)) > before) break
+    if ((await msgs.count().catch(() => 0)) > before) {
+      startedStreak++
+      if (startedStreak >= 2) break
+    } else {
+      startedStreak = 0
+    }
     await sleep(jitter(600, 1200))
   }
-  if (!((await msgs.count().catch(() => 0)) > before)) {
+  if (startedStreak < 2) {
     throw new Error(`no response started within ${Math.round(TURN_TIMEOUT_MS / 1000)}s`)
   }
   let lastText = ''
@@ -166,6 +193,7 @@ async function waitForReply(page, before) {
       if (stable >= 2 && !busy) return text.trim()
     } else {
       stable = 0
+      if (text !== null && text !== lastText && onPartial && text.trim()) onPartial(text.trim())
       lastText = text ?? ''
     }
     await sleep(jitter(700, 1300))
@@ -201,10 +229,21 @@ export async function runTurn(jobId) {
       const composer = await waitForComposer(page)
       await humanPace()
       await sleep(jitter(1500, 4000))
+      if (job.files && job.files.length) await uploadFiles(page, job.files)
       const before = await page.locator(ASSISTANT_SEL).count()
       await typePrompt(page, composer, job.prompt)
       await sendPrompt(page)
-      const reply = await waitForReply(page, before)
+      let lastPartial = 0
+      const reply = await waitForReply(page, before, (partial) => {
+        if (Date.now() - lastPartial < 2000) return
+        lastPartial = Date.now()
+        const j = readJob(jobId)
+        if (j && j.status !== 'error') {
+          j.status = 'streaming'
+          j.reply = partial
+          writeJob(j)
+        }
+      })
       const url = page.url()
       const j = readJob(jobId)
       j.status = 'done'

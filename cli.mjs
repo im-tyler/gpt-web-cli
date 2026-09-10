@@ -32,8 +32,10 @@ function usage() {
   console.log(`usage: chatgpt-web <command>
 
   start "prompt"      create a job and send the prompt to ChatGPT (prints job id)
+                      optional: --file <path> (repeatable) attaches files
   send <id> "text"    send a follow-up in the job's conversation (prints job id)
   wait <id> [secs]    block until the job finishes, print the reply (default 600s)
+                      optional: --stream prints the reply as it grows
   list                list jobs
   status              daemon, session, usage caps, running job
   chats               list ChatGPT conversations in the profile (sidebar)
@@ -62,8 +64,11 @@ function spawnRunner(args) {
   return child
 }
 
-function cmdStart(prompt) {
-  if (!prompt) err('start needs a prompt: chatgpt-web start "prompt"')
+function cmdStart(prompt, files) {
+  if (!prompt) err('start needs a prompt: chatgpt-web start "prompt" [--file path]')
+  for (const f of files) {
+    if (!fs.existsSync(f)) err(`no such file: ${f}`)
+  }
   ensureDirs()
   reapStale()
   const r = runningJob()
@@ -76,6 +81,7 @@ function cmdStart(prompt) {
     id: newId(),
     status: 'running',
     prompt,
+    files: files.map((f) => path.resolve(f)),
     reply: null,
     url: null,
     history: [{ role: 'user', text: prompt }],
@@ -91,18 +97,22 @@ function cmdStart(prompt) {
   console.log(job.id)
 }
 
-function cmdSend(id, text) {
-  if (!id || !text) err('usage: chatgpt-web send <id> "text"')
+function cmdSend(id, text, files) {
+  if (!id || !text) err('usage: chatgpt-web send <id> "text" [--file path]')
+  for (const f of files) {
+    if (!fs.existsSync(f)) err(`no such file: ${f}`)
+  }
   ensureDirs()
   reapStale()
   const job = readJob(id)
   if (!job) err(`no such job: ${id}`)
-  if (job.status === 'running') err(`job ${id} is still running — run: chatgpt-web wait ${id}`)
+  if (job.status === 'running' || job.status === 'streaming') err(`job ${id} is still running — run: chatgpt-web wait ${id}`)
   if (!job.url) err(`job ${id} never completed a turn (no conversation url) — start a new one`)
   const s = readState()
   const lim = checkLimits(s, false)
   if (lim) err(lim)
   recordTurn(s, false)
+  job.files = files.map((f) => path.resolve(f))
   job.status = 'running'
   job.prompt = text
   job.reply = null
@@ -116,20 +126,30 @@ function cmdSend(id, text) {
   console.log(id)
 }
 
-async function cmdWait(id, timeoutSec) {
-  if (!id) err('usage: chatgpt-web wait <id> [secs]')
+async function cmdWait(id, timeoutSec, stream) {
+  if (!id) err('usage: chatgpt-web wait <id> [secs] [--stream]')
   const timeout = parseInt(timeoutSec || '600', 10) * 1000
   ensureDirs()
   const deadline = Date.now() + timeout
+  let printed = 0
   for (;;) {
     const j = readJob(id)
     if (!j) err(`no such job: ${id}`)
+    if (stream && (j.status === 'streaming' || j.status === 'done') && (j.reply || '').length > printed) {
+      process.stdout.write(j.reply.slice(printed))
+      printed = j.reply.length
+    }
     if (j.status === 'done') {
-      process.stdout.write((j.reply || '') + '\n')
+      if (stream) {
+        if ((j.reply || '').length > printed) process.stdout.write(j.reply.slice(printed))
+        process.stdout.write('\n')
+      } else {
+        process.stdout.write((j.reply || '') + '\n')
+      }
       return
     }
     if (j.status === 'error') err(j.error || 'job failed')
-    if (j.status === 'running' && j.pid && !pidAlive(j.pid)) {
+    if ((j.status === 'running' || j.status === 'streaming') && j.pid && !pidAlive(j.pid)) {
       j.status = 'error'
       j.error = `runner died (pid ${j.pid})`
       writeJob(j)
@@ -178,16 +198,32 @@ async function cmdRunner(fn, ...args) {
   await mod[fn](...args)
 }
 
-const [cmd, a, b] = process.argv.slice(2)
+const raw = process.argv.slice(2)
+const fileArgs = []
+const rest = []
+for (let i = 0; i < raw.length; i++) {
+  if (raw[i] === '--file' || raw[i] === '-f') {
+    if (!raw[i + 1]) err('--file needs a path')
+    fileArgs.push(raw[i + 1])
+    i++
+  } else if (raw[i] === '--stream') {
+    rest.push('--stream')
+  } else {
+    rest.push(raw[i])
+  }
+}
+const stream = rest.includes('--stream')
+const positional = rest.filter((x) => x !== '--stream')
+const [cmd, a, b] = positional
 switch (cmd) {
   case 'start':
-    cmdStart(a)
+    cmdStart(a, fileArgs)
     break
   case 'send':
-    cmdSend(a, b)
+    cmdSend(a, b, fileArgs)
     break
   case 'wait':
-    await cmdWait(a, b)
+    await cmdWait(a, b, stream)
     break
   case 'list':
     cmdList()
