@@ -34,7 +34,7 @@ One long-lived **plain Chrome** daemon (`--remote-debugging-port=9777`, real key
 - Jobs: `~/.chatgpt-web/jobs/<id>.json` (id, status, prompt, reply, url, history, pid). Crashed runners self-heal to `error` via pid check.
 - chatgpt.com renders a logged-out SSR shell with login buttons for a few seconds after navigation — page classification must wait for settle (`classifyPage`), never judge on first paint.
 - Response completion = assistant text stable ~1.2s + no stop button.
-- Env: `CHATGPT_WEB_HOME`, `CHATGPT_WEB_TIMEOUT` (secs/turn, default 300), `CHATGPT_WEB_CDP_PORT` (default 9777), `CHATGPT_WEB_CHROME` (binary path).
+- Env: `CHATGPT_WEB_HOME`, `CHATGPT_WEB_TIMEOUT` (secs/turn, default 300), `CHATGPT_WEB_CDP_PORT` (default 9777), `CHATGPT_WEB_CHROME` (binary path), `CHATGPT_WEB_MAX_TURNS_DAY` (default 100), `CHATGPT_WEB_MAX_NEW_CHATS` (per hour, default 6), `CHATGPT_WEB_MIN_GAP` (secs, default 8), `CHATGPT_WEB_NOTIFY=0` disables notifications.
 
 ## Pacing + caps (flag-risk reduction, v0.2)
 
