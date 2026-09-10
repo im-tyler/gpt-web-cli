@@ -1,0 +1,257 @@
+#!/usr/bin/env node
+import fs from 'node:fs'
+import { spawn, execSync } from 'node:child_process'
+import { chromium } from 'playwright-core'
+import { PROFILE_DIR, readJob, writeJob, sleep } from './jobs.mjs'
+
+const CHAT_URL = 'https://chatgpt.com/'
+const TURN_TIMEOUT_MS = parseInt(process.env.CHATGPT_WEB_TIMEOUT || '300', 10) * 1000
+const CDP_PORT = process.env.CHATGPT_WEB_CDP_PORT || '9777'
+const CDP_URL = 'http://127.0.0.1:' + CDP_PORT
+
+const COMPOSER_SEL = '#prompt-textarea, textarea[data-id], div[contenteditable="true"]'
+const ASSISTANT_SEL = '[data-message-author-role="assistant"]'
+const STOP_SEL = '[data-testid="stop-button"], button[aria-label*="stop" i]'
+const SEND_SEL = '[data-testid="send-button"], button[aria-label*="send" i]'
+const LOGIN_SEL = '[data-testid="login-button"], button:has-text("Log in")'
+
+const CHROME_CANDIDATES = process.env.CHATGPT_WEB_CHROME
+  ? [process.env.CHATGPT_WEB_CHROME]
+  : [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/google-chrome',
+      '/usr/bin/chromium',
+    ]
+
+function chromeBinary() {
+  for (const p of CHROME_CANDIDATES) if (fs.existsSync(p)) return p
+  return null
+}
+
+function profileBusy() {
+  try {
+    execSync('pgrep -f "user-data-dir=' + PROFILE_DIR + '"', { stdio: 'pipe' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function cdpAlive() {
+  try {
+    const res = await fetch(CDP_URL + '/json/version', { signal: AbortSignal.timeout(1500) })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+async function ensureBrowser() {
+  if (await cdpAlive()) return
+  if (profileBusy()) {
+    throw new Error('chatgpt-web Chrome is open without remote debugging — quit it (Cmd+Q) and retry')
+  }
+  const bin = chromeBinary()
+  if (!bin) throw new Error('no Chrome binary found — set CHATGPT_WEB_CHROME=/path/to/chrome')
+  const child = spawn(
+    bin,
+    [
+      '--remote-debugging-port=' + CDP_PORT,
+      '--user-data-dir=' + PROFILE_DIR,
+      '--no-first-run',
+      '--no-default-browser-check',
+      'about:blank',
+    ],
+    { detached: true, stdio: 'ignore' }
+  )
+  child.unref()
+  const deadline = Date.now() + 20000
+  while (Date.now() < deadline) {
+    if (await cdpAlive()) return
+    await sleep(300)
+  }
+  throw new Error('chatgpt-web Chrome started but the debugging port never came up')
+}
+
+async function withPage(fn) {
+  const browser = await chromium.connectOverCDP(CDP_URL)
+  try {
+    const context = browser.contexts()[0]
+    if (!context) throw new Error('no default context over CDP')
+    let page = context.pages().find((p) => !p.isClosed())
+    if (!page) page = await context.newPage()
+    return await fn(page)
+  } finally {
+    await browser.close().catch(() => {})
+  }
+}
+
+async function classifyPage(page) {
+  let outStreak = 0
+  const deadline = Date.now() + 20000
+  for (;;) {
+    const login = await page.locator(LOGIN_SEL).count().catch(() => 0)
+    const comp = await page.locator(COMPOSER_SEL).count().catch(() => 0)
+    if (login === 0 && comp > 0) return 'in'
+    if (login > 0 && comp === 0) {
+      outStreak++
+      if (outStreak >= 6) return 'out'
+    } else {
+      outStreak = 0
+    }
+    if (Date.now() > deadline) return 'unknown'
+    await sleep(500)
+  }
+}
+
+async function waitForComposer(page) {
+  const deadline = Date.now() + 45000
+  for (;;) {
+    const state = await classifyPage(page)
+    if (state === 'in') {
+      const el = page.locator(COMPOSER_SEL).first()
+      if ((await el.count().catch(() => 0)) > 0) return el
+    }
+    if (state === 'out' || page.url().includes('/auth/')) {
+      throw new Error('not logged in — run: chatgpt-web login')
+    }
+    const body = await page.locator('body').innerText().catch(() => '')
+    if (/verify you are human|unusual activity|access denied/i.test(body || '')) {
+      throw new Error('bot check hit — retry, or run: chatgpt-web login')
+    }
+    if (Date.now() > deadline) {
+      throw new Error('composer never appeared — retry, or run: chatgpt-web login')
+    }
+    await sleep(500)
+  }
+}
+
+async function typePrompt(page, composer, text) {
+  await composer.click()
+  const tag = await composer.evaluate((el) => el.tagName).catch(() => '')
+  if (tag === 'TEXTAREA') await composer.fill(text)
+  else await page.keyboard.insertText(text)
+}
+
+async function sendPrompt(page) {
+  const btn = page.locator(SEND_SEL).last()
+  try {
+    await btn.click({ timeout: 4000 })
+  } catch {
+    await page.keyboard.press('Enter')
+  }
+}
+
+async function waitForReply(page, before) {
+  const msgs = page.locator(ASSISTANT_SEL)
+  const started = Date.now()
+  while (Date.now() - started < TURN_TIMEOUT_MS) {
+    if ((await msgs.count().catch(() => 0)) > before) break
+    await sleep(300)
+  }
+  if (!((await msgs.count().catch(() => 0)) > before)) {
+    throw new Error(`no response started within ${Math.round(TURN_TIMEOUT_MS / 1000)}s`)
+  }
+  let lastText = ''
+  let stable = 0
+  while (Date.now() - started < TURN_TIMEOUT_MS) {
+    const text = await msgs.last().innerText().catch(() => null)
+    if (text !== null && text === lastText && text.trim()) {
+      stable++
+      const busy = await page.locator(STOP_SEL).count().catch(() => 0)
+      if (stable >= 3 && !busy) return text.trim()
+    } else {
+      stable = 0
+      lastText = text ?? ''
+    }
+    await sleep(400)
+  }
+  throw new Error('response never finished streaming (raise CHATGPT_WEB_TIMEOUT)')
+}
+
+export async function runTurn(jobId) {
+  try {
+    const job = readJob(jobId)
+    if (!job) throw new Error('job not found: ' + jobId)
+    await ensureBrowser()
+    await withPage(async (page) => {
+      await page.goto(job.url || CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      const composer = await waitForComposer(page)
+      const before = await page.locator(ASSISTANT_SEL).count()
+      await typePrompt(page, composer, job.prompt)
+      await sendPrompt(page)
+      const reply = await waitForReply(page, before)
+      const url = page.url()
+      const j = readJob(jobId)
+      j.status = 'done'
+      j.reply = reply
+      j.url = url
+      j.error = null
+      j.history.push({ role: 'assistant', text: reply })
+      writeJob(j)
+    })
+  } catch (e) {
+    let msg = String(e && e.message ? e.message : e)
+    if (/singleton/i.test(msg)) msg = 'profile is in use — quit the chatgpt-web Chrome window first'
+    const j = readJob(jobId)
+    if (j) {
+      j.status = 'error'
+      j.error = msg
+      writeJob(j)
+    }
+  }
+}
+
+export async function runLogin() {
+  await ensureBrowser()
+  console.error('chatgpt-web Chrome is open — log in to ChatGPT in its window. Waiting up to 5 minutes...')
+  await withPage(async (page) => {
+    await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    const deadline = Date.now() + 300000
+    for (;;) {
+      const state = await classifyPage(page)
+      if (state === 'in') return true
+      if (Date.now() > deadline) throw new Error('timed out waiting for login (5 min)')
+      await sleep(1500)
+    }
+  })
+  console.error('verified: logged in.')
+}
+
+export async function runChats() {
+  await ensureBrowser()
+  await withPage(async (page) => {
+    await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    let links = []
+    for (;;) {
+      const state = await classifyPage(page)
+      if (state === 'out') {
+        console.error('not logged in — run: chatgpt-web login')
+        process.exitCode = 1
+        return
+      }
+      if (state === 'in') {
+        links = await page.locator('nav a[href*="/c/"]').all()
+        if (links.length) break
+      }
+      if (Date.now() > deadline) break
+      await sleep(500)
+    }
+    if (!links.length) {
+      console.log('no chats found')
+      return
+    }
+    for (const l of links) {
+      const href = (await l.getAttribute('href')) || ''
+      const id = ((href.split('/c/')[1] || '').split('/')[0]).split('?')[0]
+      const title = ((await l.innerText().catch(() => '')).split('\n')[0] || '').trim()
+      console.log(id.padEnd(16), title.slice(0, 60))
+    }
+  })
+}
+
+const [cmd, arg] = process.argv.slice(2)
+if (cmd === 'job') {
+  await runTurn(arg)
+}

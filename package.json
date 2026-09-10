@@ -1,0 +1,12 @@
+{
+  "name": "chatgpt-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "chatgpt-web": "cli.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}
