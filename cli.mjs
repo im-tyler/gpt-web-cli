@@ -33,6 +33,9 @@ function usage() {
   wait <id> [secs]    block until the job finishes, print the reply (default 600s)
   list                list jobs
   chats               list ChatGPT conversations in the profile (sidebar)
+  files <chat-id>     list files created in a conversation
+  download <chat-id> [n|all] [outdir]
+                      save conversation files to disk (default: all, current dir)
   login               open the chatgpt-web Chrome window and wait until you log in
 
 The Chrome window stays open in the background (minimize it) — it owns the
@@ -155,6 +158,12 @@ async function cmdChats() {
   await runChats()
 }
 
+async function cmdRunner(fn, ...args) {
+  ensureDirs()
+  const mod = await import('./runner.mjs')
+  await mod[fn](...args)
+}
+
 const [cmd, a, b] = process.argv.slice(2)
 switch (cmd) {
   case 'start':
@@ -171,6 +180,12 @@ switch (cmd) {
     break
   case 'chats':
     await cmdChats()
+    break
+  case 'files':
+    await cmdRunner('runFiles', a)
+    break
+  case 'download':
+    await cmdRunner('runDownload', a, b, process.argv[5])
     break
   case 'login':
     await cmdLogin()

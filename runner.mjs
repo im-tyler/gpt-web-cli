@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs'
+import path from 'node:path'
 import { spawn, execSync } from 'node:child_process'
 import { chromium } from 'playwright-core'
 import { PROFILE_DIR, readJob, writeJob, sleep } from './jobs.mjs'
@@ -247,6 +248,119 @@ export async function runChats() {
       const id = ((href.split('/c/')[1] || '').split('/')[0]).split('?')[0]
       const title = ((await l.innerText().catch(() => '')).split('\n')[0] || '').trim()
       console.log(id.padEnd(16), title.slice(0, 60))
+    }
+  })
+}
+
+const ICON_SEL = '[data-testid="library-file-icon"]'
+
+async function captureChatFiles(page, chatId) {
+  const url = CHAT_URL + 'c/' + chatId
+  const files = []
+  for (let i = 0; ; i++) {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await sleep(6000)
+    const icons = await page.locator(ICON_SEL).count().catch(() => 0)
+    if (icons === 0) {
+      if (i === 0) throw new Error('no file cards in this conversation')
+      break
+    }
+    if (i >= icons) break
+    const respP = page
+      .waitForResponse((r) => /estuary\/content/.test(r.url()), { timeout: 8000 })
+      .catch(() => null)
+    await page.locator(ICON_SEL).nth(i).click()
+    let resp = await respP
+    let simple = null
+    if (!resp) {
+      const simpleP = page
+        .waitForResponse((r) => /\/files\/.+\/simple/.test(r.url()), { timeout: 3000 })
+        .catch(() => null)
+      await page.locator(ICON_SEL).nth(i).click()
+      resp = simple = await simpleP
+    }
+    if (!resp) continue
+    const u = new URL(resp.url())
+    let id = u.searchParams.get('id') || ''
+    let name = u.searchParams.get('fn') || ''
+    if (!id && simple) {
+      id = simple.url().split('/files/')[1].split('/')[0]
+      try {
+        const j = JSON.parse((await simple.body()).toString('utf8'))
+        name = j.file_name || name
+      } catch {}
+    }
+    if (!id || seen(files, id)) continue
+    const bytes = await fileBytes(page, resp)
+    files.push({ id, name: name || id + '.bin', bytes })
+    if (files.length >= icons) break
+  }
+  return files
+}
+
+function seen(files, id) {
+  return files.some((f) => f.id === id)
+}
+
+async function fileBytes(page, resp) {
+  let bytes = Buffer.from(await resp.body())
+  const ct = resp.headers()['content-type'] || ''
+  if (ct.includes('json')) {
+    let du = null
+    try {
+      du = JSON.parse(bytes.toString('utf8')).download_url
+    } catch {}
+    if (du) {
+      bytes = Buffer.from(
+        await page.evaluate(async (u) => {
+          const r = await fetch(u, { credentials: 'include' })
+          return new Uint8Array(await r.arrayBuffer())
+        }, du)
+      )
+    }
+  }
+  return bytes
+}
+
+export async function runFiles(chatId) {
+  if (!chatId) throw new Error('usage: chatgpt-web files <chat-id>')
+  await ensureBrowser()
+  await withPage(async (page) => {
+    const files = await captureChatFiles(page, chatId)
+    if (!files.length) {
+      console.log('no files')
+      return
+    }
+    files.forEach((f, i) => {
+      console.log(String(i + 1).padEnd(4), f.name.slice(0, 48).padEnd(50), f.id)
+    })
+  })
+}
+
+export async function runDownload(chatId, what, outdir) {
+  if (!chatId) throw new Error('usage: chatgpt-web download <chat-id> [n|all] [outdir]')
+  const target = what || 'all'
+  const dir = outdir || process.cwd()
+  await ensureBrowser()
+  await withPage(async (page) => {
+    const files = await captureChatFiles(page, chatId)
+    if (!files.length) {
+      console.log('no files')
+      return
+    }
+    const picks =
+      target === 'all' ? files : files.slice(parseInt(target, 10) - 1, parseInt(target, 10))
+    if (!picks.length) {
+      console.error(`no file #${target} (have ${files.length})`)
+      process.exitCode = 1
+      return
+    }
+    fs.mkdirSync(dir, { recursive: true })
+    for (const f of picks) {
+      const safe = f.name.replace(/[^A-Za-z0-9._-]/g, '_')
+      const p = path.join(dir, safe)
+      fs.writeFileSync(p, f.bytes)
+      console.log(p, `(${f.bytes.length} bytes)`)
     }
   })
 }
