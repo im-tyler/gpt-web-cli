@@ -8,6 +8,11 @@
 - `send <id> "text"` -> follow-up in the same conversation
 - `wait <id> [secs]` -> blocks, prints reply, exit 1 on error (default 600s)
 - `list`, `chats`, `login`
+- `files <chat-id>` / `download <chat-id> [n|all] [outdir]` -> conversation file artifacts
+
+## File download notes
+
+Agent-chat files have no stable listing API (conversation endpoint 404s; `/interpreter/download` needs message_id + sandbox_path). Working approach: click each `[data-testid="library-file-icon"]` (reload the page between clicks — the estuary fetch is cache-swallowed on repeat clicks in one session), intercept `GET /backend-api/estuary/content?id=<file_id>&fn=<name>` and read `response.body()` IMMEDIATELY (bodies die on next navigation). 4 sidebar icons may be 2-4 unique files; dedupe by id.
 
 ## Architecture (do not regress this)
 
