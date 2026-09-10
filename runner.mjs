@@ -199,19 +199,35 @@ async function waitForComposer(page) {
 }
 
 async function typePrompt(page, composer, text) {
-  await composer.click()
+  await composer.click({ force: true })
   const tag = await composer.evaluate((el) => el.tagName).catch(() => '')
-  if (tag === 'TEXTAREA') await composer.fill(text)
-  else await page.keyboard.insertText(text)
+  if (tag === 'TEXTAREA') {
+    await composer.fill(text)
+    return
+  }
+  await composer.evaluate((el) => {
+    el.focus()
+    const sel = window.getSelection()
+    const range = document.createRange()
+    range.selectNodeContents(el)
+    sel.removeAllRanges()
+    sel.addRange(range)
+  })
+  await page.keyboard.insertText(text)
 }
 
 async function sendPrompt(page) {
-  const btn = page.locator(SEND_SEL).last()
-  try {
-    await btn.click({ timeout: 4000 })
-  } catch {
-    await page.keyboard.press('Enter')
-  }
+  await page.waitForFunction(() => {
+    const b = document.querySelector('#composer-submit-button, [data-testid="send-button"]')
+    return b && b.getAttribute('aria-disabled') !== 'true'
+  }, null, { timeout: 8000 })
+  const clicked = await page.evaluate(() => {
+    const b = document.querySelector('#composer-submit-button, [data-testid="send-button"]')
+    if (!b) return false
+    b.click()
+    return true
+  })
+  if (!clicked) await page.keyboard.press('Enter')
 }
 
 async function uploadFiles(page, paths) {
