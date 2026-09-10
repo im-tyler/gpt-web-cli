@@ -15,6 +15,9 @@ import {
   runningJob,
   pidAlive,
   sleep,
+  readState,
+  checkLimits,
+  recordTurn,
 } from './jobs.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -32,6 +35,7 @@ function usage() {
   send <id> "text"    send a follow-up in the job's conversation (prints job id)
   wait <id> [secs]    block until the job finishes, print the reply (default 600s)
   list                list jobs
+  status              daemon, session, usage caps, running job
   chats               list ChatGPT conversations in the profile (sidebar)
   files <chat-id>     list files created in a conversation
   download <chat-id> [n|all] [outdir]
@@ -43,7 +47,9 @@ login session and all turns run through it.
 
 env: CHATGPT_WEB_HOME=${HOME}
      CHATGPT_WEB_TIMEOUT=<secs per turn, default 300>
-     CHATGPT_WEB_CDP_PORT=<default 9777>`)
+     CHATGPT_WEB_CDP_PORT=<default 9777>
+     CHATGPT_WEB_MAX_TURNS_DAY=<default 100>  CHATGPT_WEB_MAX_NEW_CHATS=<per hour, default 6>
+     CHATGPT_WEB_MIN_GAP=<secs between turns, default 8>  CHATGPT_WEB_NOTIFY=0 disables notifications`)
 }
 
 function spawnRunner(args) {
@@ -62,6 +68,10 @@ function cmdStart(prompt) {
   reapStale()
   const r = runningJob()
   if (r) err(`job ${r.id} is still running — run: chatgpt-web wait ${r.id}`)
+  const s = readState()
+  const lim = checkLimits(s, true)
+  if (lim) err(lim)
+  recordTurn(s, true)
   const job = {
     id: newId(),
     status: 'running',
@@ -89,6 +99,10 @@ function cmdSend(id, text) {
   if (!job) err(`no such job: ${id}`)
   if (job.status === 'running') err(`job ${id} is still running — run: chatgpt-web wait ${id}`)
   if (!job.url) err(`job ${id} never completed a turn (no conversation url) — start a new one`)
+  const s = readState()
+  const lim = checkLimits(s, false)
+  if (lim) err(lim)
+  recordTurn(s, false)
   job.status = 'running'
   job.prompt = text
   job.reply = null
@@ -186,6 +200,9 @@ switch (cmd) {
     break
   case 'download':
     await cmdRunner('runDownload', a, b, process.argv[5])
+    break
+  case 'status':
+    await cmdRunner('runStatus')
     break
   case 'login':
     await cmdLogin()

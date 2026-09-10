@@ -78,3 +78,58 @@ export function reapStale() {
     }
   }
 }
+
+export const STATE_FILE = path.join(HOME, 'state.json')
+
+export function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
+  } catch {
+    return { lastTurnEnd: 0, newChats: [], turns: {} }
+  }
+}
+
+export function writeState(s) {
+  fs.mkdirSync(HOME, { recursive: true })
+  const tmp = STATE_FILE + '.tmp'
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2))
+  fs.renameSync(tmp, STATE_FILE)
+}
+
+export function dayKey(d = new Date()) {
+  return d.toISOString().slice(0, 10)
+}
+
+export function limits() {
+  return {
+    maxNewChatsHour: parseInt(process.env.CHATGPT_WEB_MAX_NEW_CHATS || '6', 10),
+    maxTurnsDay: parseInt(process.env.CHATGPT_WEB_MAX_TURNS_DAY || '100', 10),
+    minGapMs: parseInt(process.env.CHATGPT_WEB_MIN_GAP || '8', 10) * 1000,
+  }
+}
+
+export function checkLimits(s, isNewChat) {
+  const L = limits()
+  const today = (s.turns || {})[dayKey()] || 0
+  if (today >= L.maxTurnsDay) {
+    return `daily turn cap reached (${today}/${L.maxTurnsDay}) — raise CHATGPT_WEB_MAX_TURNS_DAY or wait`
+  }
+  if (isNewChat) {
+    const recent = (s.newChats || []).filter((t) => Date.now() - t < 3600000)
+    if (recent.length >= L.maxNewChatsHour) {
+      return `new-chat cap reached (${recent.length}/${L.maxNewChatsHour} per hour) — use send on an existing job or wait`
+    }
+  }
+  return null
+}
+
+export function recordTurn(s, isNewChat) {
+  const k = dayKey()
+  s.turns = s.turns || {}
+  s.turns[k] = (s.turns[k] || 0) + 1
+  for (const old of Object.keys(s.turns)) if (old !== k && Object.keys(s.turns).length > 7) delete s.turns[old]
+  if (isNewChat) {
+    s.newChats = [...(s.newChats || []).filter((t) => Date.now() - t < 3600000), Date.now()]
+  }
+  writeState(s)
+}

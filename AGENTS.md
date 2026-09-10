@@ -7,7 +7,7 @@
 - `start "prompt"` -> prints job id, returns immediately
 - `send <id> "text"` -> follow-up in the same conversation
 - `wait <id> [secs]` -> blocks, prints reply, exit 1 on error (default 600s)
-- `list`, `chats`, `login`
+- `list`, `status`, `chats`, `login`
 - `files <chat-id>` / `download <chat-id> [n|all] [outdir]` -> conversation file artifacts
 
 ## File download notes
@@ -29,6 +29,16 @@ One long-lived **plain Chrome** daemon (`--remote-debugging-port=9777`, real key
 - Response completion = assistant text stable ~1.2s + no stop button.
 - Env: `CHATGPT_WEB_HOME`, `CHATGPT_WEB_TIMEOUT` (secs/turn, default 300), `CHATGPT_WEB_CDP_PORT` (default 9777), `CHATGPT_WEB_CHROME` (binary path).
 
+## Pacing + caps (flag-risk reduction, v0.2)
+
+Behavioral camouflage is the priority — NOT fingerprint spoofing (real Chrome + zero flags already; spoofing would create tells). Built in:
+
+- Randomized human pacing: 8-16s enforced gap between turns (`CHATGPT_WEB_MIN_GAP`), 1.5-4s settle before typing, jittered poll intervals (~0.6-1.3s).
+- Caps in `~/.chatgpt-web/state.json`: max 100 turns/day (`CHATGPT_WEB_MAX_TURNS_DAY`), max 6 new conversations/hour (`CHATGPT_WEB_MAX_NEW_CHATS`) — `start`/`send` refuse with exit 1 when hit; prefer `send` follow-ups over new chats.
+- macOS notification on every turn end/error (`CHATGPT_WEB_NOTIFY=0` to disable).
+- `status` command: daemon, session, usage vs caps, running job.
+- Account hygiene matters more than code: automation runs on a secondary account, never a business one.
+
 ## State
 
-Working end-to-end 2026-09-09: login (auto-detects completion), start/send/wait, chats listing. Known limitation: Chrome auto-update restarts kill the daemon port mid-turn; next command respawns (job errors, retry).
+Working end-to-end 2026-09-09: login (auto-detects completion), start/send/wait, chats listing, files/download (agent-chat artifacts via estuary interception), status, pacing + caps. Known limitation: Chrome auto-update restarts kill the daemon port mid-turn; next command respawns (job errors, retry).

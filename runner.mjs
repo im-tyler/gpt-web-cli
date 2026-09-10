@@ -3,7 +3,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn, execSync } from 'node:child_process'
 import { chromium } from 'playwright-core'
-import { PROFILE_DIR, readJob, writeJob, sleep } from './jobs.mjs'
+import { PROFILE_DIR, readJob, writeJob, sleep, readState, writeState, limits, dayKey, runningJob } from './jobs.mjs'
+
+const jitter = (a, b) => a + Math.random() * (b - a)
 
 const CHAT_URL = 'https://chatgpt.com/'
 const TURN_TIMEOUT_MS = parseInt(process.env.CHATGPT_WEB_TIMEOUT || '300', 10) * 1000
@@ -88,9 +90,9 @@ async function withPage(fn) {
   }
 }
 
-async function classifyPage(page) {
+async function classifyPage(page, deadlineMs = 20000) {
   let outStreak = 0
-  const deadline = Date.now() + 20000
+  const deadline = Date.now() + deadlineMs
   for (;;) {
     const login = await page.locator(LOGIN_SEL).count().catch(() => 0)
     const comp = await page.locator(COMPOSER_SEL).count().catch(() => 0)
@@ -102,7 +104,7 @@ async function classifyPage(page) {
       outStreak = 0
     }
     if (Date.now() > deadline) return 'unknown'
-    await sleep(500)
+    await sleep(jitter(500, 1000))
   }
 }
 
@@ -149,7 +151,7 @@ async function waitForReply(page, before) {
   const started = Date.now()
   while (Date.now() - started < TURN_TIMEOUT_MS) {
     if ((await msgs.count().catch(() => 0)) > before) break
-    await sleep(300)
+    await sleep(jitter(600, 1200))
   }
   if (!((await msgs.count().catch(() => 0)) > before)) {
     throw new Error(`no response started within ${Math.round(TURN_TIMEOUT_MS / 1000)}s`)
@@ -161,14 +163,32 @@ async function waitForReply(page, before) {
     if (text !== null && text === lastText && text.trim()) {
       stable++
       const busy = await page.locator(STOP_SEL).count().catch(() => 0)
-      if (stable >= 3 && !busy) return text.trim()
+      if (stable >= 2 && !busy) return text.trim()
     } else {
       stable = 0
       lastText = text ?? ''
     }
-    await sleep(400)
+    await sleep(jitter(700, 1300))
   }
   throw new Error('response never finished streaming (raise CHATGPT_WEB_TIMEOUT)')
+}
+
+function notify(title, body) {
+  if (process.env.CHATGPT_WEB_NOTIFY === '0') return
+  try {
+    execSync(
+      `osascript -e 'display notification "${String(body).replace(/["']/g, '').slice(0, 90)}" with title "${title}"'`,
+      { stdio: 'ignore', timeout: 5000 }
+    )
+  } catch {}
+}
+
+async function humanPace() {
+  const s = readState()
+  const L = limits()
+  const since = Date.now() - (s.lastTurnEnd || 0)
+  const gap = L.minGapMs + Math.random() * 8000
+  if (since < gap) await sleep(gap - since)
 }
 
 export async function runTurn(jobId) {
@@ -179,6 +199,8 @@ export async function runTurn(jobId) {
     await withPage(async (page) => {
       await page.goto(job.url || CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
       const composer = await waitForComposer(page)
+      await humanPace()
+      await sleep(jitter(1500, 4000))
       const before = await page.locator(ASSISTANT_SEL).count()
       await typePrompt(page, composer, job.prompt)
       await sendPrompt(page)
@@ -191,6 +213,7 @@ export async function runTurn(jobId) {
       j.error = null
       j.history.push({ role: 'assistant', text: reply })
       writeJob(j)
+      notify('chatgpt-web: done', reply.slice(0, 90))
     })
   } catch (e) {
     let msg = String(e && e.message ? e.message : e)
@@ -201,6 +224,11 @@ export async function runTurn(jobId) {
       j.error = msg
       writeJob(j)
     }
+    notify('chatgpt-web: error', msg)
+  } finally {
+    const s = readState()
+    s.lastTurnEnd = Date.now()
+    writeState(s)
   }
 }
 
@@ -363,6 +391,30 @@ export async function runDownload(chatId, what, outdir) {
       console.log(p, `(${f.bytes.length} bytes)`)
     }
   })
+}
+
+export async function runStatus() {
+  const up = await cdpAlive()
+  console.log('daemon:', up ? 'up (CDP port ' + CDP_PORT + ')' : 'down (next command starts it)')
+  const s = readState()
+  const L = limits()
+  const hourChats = (s.newChats || []).filter((t) => Date.now() - t < 3600000).length
+  console.log(
+    `usage: ${(s.turns || {})[dayKey()] || 0}/${L.maxTurnsDay} turns today, ` +
+      `${hourChats}/${L.maxNewChatsHour} new chats this hour, min gap ${L.minGapMs / 1000}s`
+  )
+  const r = runningJob()
+  console.log('running job:', r ? r.id + ' — ' + (r.prompt || '').slice(0, 50) : 'none')
+  if (up) {
+    await withPage(async (page) => {
+      await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      const state = await classifyPage(page, 10000)
+      console.log(
+        'session:',
+        state === 'in' ? 'logged in' : state === 'out' ? 'logged out — run: chatgpt-web login' : 'unknown'
+      )
+    })
+  }
 }
 
 const [cmd, arg] = process.argv.slice(2)
