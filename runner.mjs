@@ -14,9 +14,20 @@ const CDP_URL = 'http://127.0.0.1:' + CDP_PORT
 
 const COMPOSER_SEL = '#prompt-textarea, textarea[data-id], div[contenteditable="true"]'
 const ASSISTANT_SEL = '[data-message-author-role="assistant"]'
+const USER_SEL = '[data-message-author-role="user"]'
 const STOP_SEL = '[data-testid="stop-button"], button[aria-label*="stop" i]'
 const SEND_SEL = '[data-testid="send-button"], button[aria-label*="send" i]'
 const LOGIN_SEL = '[data-testid="login-button"], button:has-text("Log in")'
+const NEW_CHAT_SEL = 'nav a[href="/"], [data-testid*="new-chat"] a, a:has-text("New chat")'
+
+function convIdOf(url) {
+  const m = String(url || '').match(/\/c\/([0-9a-fA-F-]{8,})/)
+  return m ? m[1] : null
+}
+
+function normText(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim()
+}
 
 const CHROME_CANDIDATES = process.env.CHATGPT_WEB_CHROME
   ? [process.env.CHATGPT_WEB_CHROME]
@@ -252,12 +263,90 @@ async function uploadFiles(page, paths) {
   throw new Error('upload never completed (attach chips missing)')
 }
 
-async function waitForReply(page, before, onPartial) {
+async function ensureFreshChat(page, composer) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await sleep(jitter(2000, 3000))
+    if (!convIdOf(page.url())) {
+      const value = await composer.inputValue().catch(() => '')
+      if (!value || !value.trim()) return
+    }
+    const newChat = page.locator(NEW_CHAT_SEL).first()
+    if ((await newChat.count().catch(() => 0)) === 0) continue
+    await newChat.click({ force: true, timeout: 10000 }).catch(() => {})
+    const deadline = Date.now() + 10000
+    while (Date.now() < deadline) {
+      if (!convIdOf(page.url())) return
+      await sleep(500)
+    }
+  }
+  throw new Error(
+    'ChatGPT resumed an existing conversation and a fresh chat could not be started — ' +
+      'refusing to type into a conversation this job does not own'
+  )
+}
+
+async function assertBoundConversation(page, job) {
+  const want = convIdOf(job.url)
+  if (!want) throw new Error('job url has no conversation id: ' + job.url)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await sleep(jitter(1500, 2500))
+    if (convIdOf(page.url()) === want) return
+    await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+  }
+  throw new Error(
+    `tab is not on the job's conversation (want ${want}, at ${page.url()}) — refusing to send`
+  )
+}
+
+async function captureConversationUrl(page, jobId) {
+  const deadline = Date.now() + 60000
+  while (Date.now() < deadline) {
+    const id = convIdOf(page.url())
+    if (id) {
+      const url = page.url()
+      const j = readJob(jobId)
+      if (j) {
+        j.url = url
+        writeJob(j)
+      }
+      return url
+    }
+    await sleep(500)
+  }
+  throw new Error('conversation url never appeared after send (no /c/<id>)')
+}
+
+async function verifyPromptLanded(page, prompt) {
+  const prefix = normText(prompt).slice(0, 60)
+  if (!prefix) return
+  const users = page.locator(USER_SEL)
+  const n = await users.count().catch(() => 0)
+  if (n === 0) throw new Error('reply verification failed: no user message in conversation')
+  const last = normText(await users.last().innerText().catch(() => ''))
+  if (!last.includes(prefix)) {
+    throw new Error(
+      'reply verification failed: conversation does not contain this turn\'s prompt — ' +
+        'refusing to record a possibly foreign reply (conversation cross-talk guard)'
+    )
+  }
+}
+
+async function waitForReply(page, before, boundUrl, onPartial) {
+  const boundId = convIdOf(boundUrl)
   const msgs = page.locator(ASSISTANT_SEL)
+  const onBoundConversation = async () => convIdOf(page.url()) === boundId
+  const rebind = async () => {
+    await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await sleep(jitter(1500, 3000))
+    return Math.max(before, await msgs.count().catch(() => 0))
+  }
   const started = Date.now()
   let startedStreak = 0
   while (Date.now() - started < TURN_TIMEOUT_MS) {
-    if ((await msgs.count().catch(() => 0)) > before) {
+    if (!(await onBoundConversation().catch(() => false))) {
+      before = await rebind()
+      startedStreak = 0
+    } else if ((await msgs.count().catch(() => 0)) > before) {
       startedStreak++
       if (startedStreak >= 2) break
     } else {
@@ -271,6 +360,12 @@ async function waitForReply(page, before, onPartial) {
   let lastText = ''
   let stable = 0
   while (Date.now() - started < TURN_TIMEOUT_MS) {
+    if (!(await onBoundConversation().catch(() => false))) {
+      before = await rebind()
+      lastText = ''
+      stable = 0
+      continue
+    }
     const text = await msgs.last().innerText().catch(() => null)
     if (text !== null && text === lastText && text.trim()) {
       stable++
@@ -303,7 +398,14 @@ export async function runTurn(jobId) {
     await ensureBrowser()
     await withPage(async (page) => {
       await page.goto(job.url || CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
-      const composer = await waitForComposer(page)
+      let composer = await waitForComposer(page)
+      if (job.url) {
+        await assertBoundConversation(page, job)
+        composer = await waitForComposer(page)
+      } else {
+        await ensureFreshChat(page, composer)
+        composer = await waitForComposer(page)
+      }
       let before = 0
       await withLock('send', async () => {
         const s = readState()
@@ -320,8 +422,9 @@ export async function runTurn(jobId) {
         s2.lastSendAt = Date.now()
         writeState(s2)
       })
+      const boundUrl = job.url || (await captureConversationUrl(page, jobId))
       let lastPartial = 0
-      const reply = await waitForReply(page, before, (partial) => {
+      const reply = await waitForReply(page, before, boundUrl, (partial) => {
         if (Date.now() - lastPartial < 2000) return
         lastPartial = Date.now()
         const j = readJob(jobId)
@@ -331,7 +434,12 @@ export async function runTurn(jobId) {
           writeJob(j)
         }
       })
-      const url = page.url()
+      if (convIdOf(page.url()) !== convIdOf(boundUrl)) {
+        await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
+        await sleep(jitter(1500, 3000))
+      }
+      await verifyPromptLanded(page, job.prompt)
+      const url = boundUrl
       const j = readJob(jobId)
       j.status = 'done'
       j.reply = reply

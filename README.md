@@ -29,3 +29,4 @@ chatgpt-web status                        # daemon, session, usage vs caps
 - macOS only (hides the Chrome window via System Events).
 - The Chrome daemon must stay alive — minimize is fine, quitting loses the session.
 - Runs against your own ChatGPT account via the web UI, so it paces itself: randomized human-like send gaps, daily turn caps, and new-chat limits (all tunable via `CHATGPT_WEB_*` env vars).
+- Concurrent turns (up to `CHATGPT_WEB_MAX_TABS`, default 2) run in separate tabs. Every turn is bound to a conversation id: a fresh turn forces a new chat if `chatgpt.com/` auto-resumes a recent conversation, follow-ups verify the tab is on the job's own conversation, reply waits re-navigate if the tab drifts, and a reply is only recorded after verifying the turn's prompt is the conversation's last user message — foreign replies are refused, never recorded.
