@@ -108,78 +108,44 @@ export function runningJobs() {
 
 export const LOCKS_DIR = path.join(HOME, 'locks')
 
-// withLock runs fn while holding an inter-process mkdir lock.
-//
-// Stealing a stale lock is done by RENAMING the stale directory aside: the
-// rename is atomic, so exactly one contender wins it, and the others see
-// the directory gone and race for a fresh mkdir. The old read-check-delete
-// sequence let two contenders who both read a dead owner race, with the
-// loser deleting the winner's freshly created lock and entering beside it.
-// A holder displaced by a steal finds its owner.json gone with the renamed
-// directory and removes nothing. An ownerless lock directory (a crash
-// between mkdir and publishing owner.json) is stealable by directory age,
-// so it cannot wedge acquisition forever.
-export async function withLock(name, fn, { staleMs = 120000, timeoutMs = 600000 } = {}) {
-  fs.mkdirSync(LOCKS_DIR, { recursive: true })
-  const dir = path.join(LOCKS_DIR, name + '.lock')
-  const ownerFile = path.join(dir, 'owner.json')
-  const token = crypto.randomUUID()
+// withLock runs fn while holding an exclusive kernel advisory lock on a
+// persistent lock file. The kernel, not a PID-and-age heuristic, owns lock
+// lifetime: the lock dies with its file descriptor, mutual exclusion does
+// not depend on reading stale metadata, and no removal race can admit two
+// holders. Lock files are permanent — unlinking a live lock file would let
+// different processes lock different inodes of the same name.
+export async function withLock(name, fn, { timeoutMs = 600000 } = {}) {
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error('invalid lock name')
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new Error('invalid lock timeout')
+  const { default: fsExt } = await import('fs-ext')
+  fs.mkdirSync(LOCKS_DIR, { recursive: true, mode: 0o700 })
+  const file = path.join(LOCKS_DIR, name + '.flock')
+  const flags = fs.constants.O_CREAT | fs.constants.O_RDWR | fs.constants.O_NOFOLLOW
+  const fd = fs.openSync(file, flags, 0o600)
+  const flock = (operation) =>
+    new Promise((resolve, reject) => {
+      fsExt.flock(fd, operation, (error) => (error ? reject(error) : resolve()))
+    })
   const deadline = Date.now() + timeoutMs
-  for (;;) {
-    try {
-      fs.mkdirSync(dir)
-      // Publish owner.json atomically (write a dotfile, rename it in): a
-      // crash between mkdir and publish must not leave a lock that reads
-      // as both ownerless and unparseable.
-      const pending = path.join(dir, '.owner.' + crypto.randomUUID())
-      fs.writeFileSync(pending, JSON.stringify({ pid: process.pid, token, at: Date.now() }), { mode: 0o600 })
-      fs.renameSync(pending, ownerFile)
-      break
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e
-      try {
-        let stealable = false
-        try {
-          const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'))
-          // A published owner decides: steal only when it recorded itself
-          // long enough ago AND its pid is gone. The owner's timestamp, not
-          // the directory's mtime — a holder that died the moment it took
-          // the lock is dead regardless of how young the directory is.
-          stealable = Date.now() - (owner.at || 0) > staleMs && !pidAlive(owner.pid)
-        } catch {
-          // No owner published (crash between mkdir and publish): the
-          // directory's age is the only witness.
-          const st = fs.statSync(dir)
-          stealable = Date.now() - st.mtimeMs > staleMs
-        }
-        if (stealable) {
-          // Atomic steal: the rename succeeds for exactly one contender.
-          // The renamed copy is dead evidence; the winner removes it rather
-          // than letting steals accumulate directories forever.
-          const quarantine = dir + '.stale-' + crypto.randomUUID()
-          try {
-            fs.renameSync(dir, quarantine)
-            fs.rmSync(quarantine, { recursive: true, force: true })
-          } catch {
-            // Someone else stole it first; loop for the fresh mkdir.
-          }
-        }
-      } catch {}
-      if (Date.now() > deadline) throw new Error('lock timeout: ' + name)
-      await sleep(500 + Math.random() * 500)
-    }
-  }
   try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('lock is not a regular file')
+    fs.fchmodSync(fd, 0o600)
+    for (;;) {
+      try {
+        await flock('exnb')
+        break
+      } catch (error) {
+        if (!['EAGAIN', 'EWOULDBLOCK', 'EINTR'].includes(error.code)) throw error
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) throw new Error('lock timeout: ' + name)
+        await sleep(Math.min(50, remaining))
+      }
+    }
     return await fn()
   } finally {
-    try {
-      const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'))
-      if (owner && owner.token === token) {
-        fs.rmSync(dir, { recursive: true, force: true })
-      }
-    } catch {
-      // The lock was stolen and renamed away: nothing of ours to remove.
-    }
+    // Close releases the kernel lock, including when fn throws. Process
+    // death also releases it; no PID probe, lease stealing, or rm is needed.
+    fs.closeSync(fd)
   }
 }
 

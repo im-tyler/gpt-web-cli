@@ -5,6 +5,8 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 // Every test gets its own HOME so the real ~/.chatgpt-web is untouched.
 function freshHome() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cgw-test-'))
@@ -155,58 +157,99 @@ test('jobPath rejects traversal (H02)', async () => {
   assert.doesNotThrow(() => jobs.jobPath('mtwk9zfz-72efe1'))
 })
 
-// A03: the lock steals by atomic rename, so two stale-breakers cannot both
-// enter, and an ownerless lock is recoverable by age.
-test('locks: ownerless recovery and single-winner steal (A03)', async () => {
+// A03/F01: kernel flock — mutual exclusion across real processes, released
+// by process death, no directory heuristics at all.
+test('locks: kernel flock excludes a second process and releases on death (A03)', async () => {
   freshHome()
   const jobs = await loadJobs()
-  const dir = path.join(process.env.CHATGPT_WEB_HOME, 'locks', 'orphan.lock')
-  fs.mkdirSync(dir, { recursive: true })
-  // Ownerless and old: stealable.
-  const old = Date.now() / 1000 - 400
-  fs.utimesSync(dir, old, old)
-  let held = false
-  await jobs.withLock('orphan', () => {
-    held = true
-  }, { timeoutMs: 5000 })
-  assert.ok(held, 'ownerless stale lock was recovered')
+  const { spawn } = await import('node:child_process')
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { writeFileSync } from 'node:fs'
+    const { withLock } = await import(${JSON.stringify(new URL('./jobs.mjs', import.meta.url).href)})
+    await withLock('shared', async () => {
+      writeFileSync(process.env.MARK, 'held')
+      await new Promise((r) => setTimeout(r, 10000))
+    })
+  `], { env: { ...process.env, MARK: path.join(process.env.CHATGPT_WEB_HOME, 'held') }, stdio: 'ignore' })
+  holder.unref()
+  // Wait until the child holds the lock.
+  const mark = path.join(process.env.CHATGPT_WEB_HOME, 'held')
+  const t0 = Date.now()
+  while (!fs.existsSync(mark) && Date.now() - t0 < 10000) await sleep(100)
+  assert.ok(fs.existsSync(mark), 'holder never acquired')
 
-  // Two simultaneous contenders for a dead-owner lock: exactly one enters.
-  const dead = path.join(process.env.CHATGPT_WEB_HOME, 'locks', 'dead.lock')
-  fs.mkdirSync(dead, { recursive: true })
-  fs.writeFileSync(path.join(dead, 'owner.json'), JSON.stringify({ pid: 99999999, token: 'x', at: Date.now() - 999999 }))
-  const results = await Promise.allSettled(
-    Array.from({ length: 4 }, () =>
-      jobs.withLock('dead', async () => {
-        await new Promise((r) => setTimeout(r, 200))
-        return 'ran'
-      }, { timeoutMs: 15000 })
-    )
+  // A contender times out promptly while the holder lives.
+  await assert.rejects(
+    jobs.withLock('shared', () => 'ran', { timeoutMs: 1500 }),
+    /lock timeout/
   )
-  const ran = results.filter((r) => r.status === 'fulfilled' && r.value === 'ran').length
-  // All four may legitimately run SERIALLY (each steals/creates in turn);
-  // the invariant is that none failed by wedging and no lock dir was
-  // left behind by a stolen holder's cleanup.
-  assert.ok(ran >= 1, `no contender ran (${ran})`)
-  assert.ok(results.every((r) => r.status === 'fulfilled'), 'a contender wedged or crashed')
-  const leftovers = fs.readdirSync(path.join(process.env.CHATGPT_WEB_HOME, 'locks')).filter((f) => f.startsWith('dead.lock'))
-  assert.deepEqual(leftovers, [], 'lock directory left behind after contention')
+
+  // Killing the holder releases the kernel lock.
+  holder.kill('SIGKILL')
+  await new Promise((r) => setTimeout(r, 500))
+  let ran = false
+  await jobs.withLock('shared', () => { ran = true }, { timeoutMs: 10000 })
+  assert.ok(ran, 'lock not released after holder death')
 })
 
-// A03: a displaced holder's cleanup cannot remove a successor's lock.
-test('locks: displaced holder spares the successor (A03)', async () => {
-  freshHome()
-  const jobs = await loadJobs()
-  const dir = path.join(process.env.CHATGPT_WEB_HOME, 'locks', 'guarded.lock')
-  fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(
-    path.join(dir, 'owner.json'),
-    JSON.stringify({ pid: process.pid, token: 'successor-token', at: Date.now() })
+// F02: the attachment policy enforces the exact multiset.
+test('attachmentVerdict: exact multiset, states, and fail-closed UI', async () => {
+  const fixes = await loadFixes()
+  const v = fixes.attachmentVerdict
+  assert.deepStrictEqual(v({ known: true, files: [{ name: 'a.png', state: 'ready' }] }, ['a.png']), { ok: true })
+  assert.match(v({ known: true, files: [] }, ['a.png']).error, /differs/)
+  assert.match(v({ known: true, files: [{ name: 'a.png', state: 'ready' }] }, []).error, /differs/)
+  assert.deepStrictEqual(
+    v({ known: true, files: [{ name: 'uploading.txt', state: 'ready' }] }, ['uploading.txt']),
+    { ok: true },
+    'a ready file named uploading.txt is not an upload in progress'
   )
-  let ran = false
-  await jobs.withLock('guarded', () => {
-    ran = true
-  }, { timeoutMs: 3000 }).catch(() => {})
-  assert.equal(ran, false, 'second holder acquired while the successor held it')
-  assert.ok(fs.existsSync(dir), 'displaced holder deleted the successor lock')
+  assert.match(v({ known: true, files: [{ name: 'a.png', state: 'uploading' }] }, ['a.png']).error, /in progress/)
+  assert.match(v({ known: true, files: [{ name: 'a.png', state: 'error' }] }, ['a.png']).error, /failed/)
+  assert.match(v({ known: false }, []).error, /unrecognized/)
+  assert.match(v(null, []).error, /unrecognized/)
+  assert.throws(() => v({ known: true, files: [] }, 'nope'), TypeError)
+  // Duplicate basenames: two chips for two requested, not substring logic.
+  assert.deepStrictEqual(
+    v({ known: true, files: [{ name: 'a.txt', state: 'ready' }, { name: 'a.txt', state: 'ready' }] }, ['a.txt', 'a.txt']),
+    { ok: true }
+  )
+  assert.match(
+    v({ known: true, files: [{ name: 'a.txt', state: 'ready' }] }, ['a.txt', 'a.txt']).error,
+    /differs/
+  )
+})
+
+// F12: duplicate cards alias; 'all' dedupes by file id.
+test('dedupeByFileId collapses aliased cards', async () => {
+  const fixes = await loadFixes()
+  const file = { id: 'same', name: 'x', bytes: Buffer.from('x') }
+  const entries = [
+    { index: 0, ok: true, file },
+    { index: 1, ok: true, file, duplicateOf: 0 },
+    { index: 2, ok: true, file: { id: 'other', name: 'y', bytes: Buffer.from('y') } },
+  ]
+  const out = fixes.dedupeByFileId(entries)
+  assert.equal(out.length, 2)
+  assert.deepEqual(out.map((e) => e.file.id).sort(), ['other', 'same'])
+})
+
+// F05: a short write either completes or throws and removes the partial file.
+test('saveArtifact: short writes complete the file or fail clean', async () => {
+  const fixes = await loadFixes()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cgw-dl-'))
+  // Inject a short-writing fs: each writeSync call moves two bytes.
+  const orig = fs.writeSync
+  let fdSeen = null
+  fs.writeSync = function patched(fd, buffer, offset, length, position) {
+    const n = Math.min(2, length ?? buffer.length)
+    return orig(fd, buffer, offset ?? 0, n, position ?? null)
+  }
+  let p
+  try {
+    p = fixes.saveArtifact(dir, 'six.txt', 'IDX', Buffer.from('abcdef'))
+  } finally {
+    fs.writeSync = orig
+  }
+  assert.equal(fs.readFileSync(p, 'utf8'), 'abcdef', 'counted loop did not complete the file')
 })

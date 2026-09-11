@@ -67,13 +67,27 @@ export function selectDownloads(manifest, target = 'all') {
   return [entry]
 }
 
+// dedupeByFileId collapses duplicate cards (the same file shown twice) that
+// alias an already-captured entry; distinct files keep their own rows.
+export function dedupeByFileId(entries) {
+  return [...new Map(entries.map((m) => [m.file.id, m])).values()]
+}
+
+// Escape ERE syntax for pgrep; argument-vector execution alone is not
+// enough because pgrep -f treats its pattern as a regular expression. The
+// boundary guards prevent profile-prefix matches.
+export function profileProcessPattern(profileDir) {
+  const literal = String(profileDir).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return '(^|[[:space:]])--user-data-dir=' + literal + '([[:space:]]|$)'
+}
+
 // profileProbe reports whether any process is running with this profile as
 // its user-data-dir, without interpolating the path into a shell string —
 // a path containing $(...) was command substitution, and regex
 // metacharacters changed what matched.
 export function profileBusyArgv(profileDir) {
   try {
-    execFileSync('pgrep', ['-f', 'user-data-dir=' + profileDir], { stdio: 'pipe' })
+    execFileSync('pgrep', ['-f', profileProcessPattern(profileDir)], { stdio: 'pipe' })
     return true
   } catch (e) {
     // pgrep exits 1 when nothing matched; anything else is a real failure.
@@ -152,12 +166,29 @@ export function saveArtifact(dir, name, id, bytes) {
       }
       throw e
     }
+    let closed = false
     try {
-      fs.writeSync(fd, bytes)
-    } finally {
+      const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)
+      let offset = 0
+      while (offset < buffer.length) {
+        const count = fs.writeSync(fd, buffer, offset, buffer.length - offset, null)
+        if (!Number.isInteger(count) || count <= 0 || count > buffer.length - offset) {
+          throw new Error('artifact write made invalid progress')
+        }
+        offset += count
+      }
+      closed = true
       fs.closeSync(fd)
+      return dest
+    } catch (error) {
+      if (!closed) {
+        try { fs.closeSync(fd) } catch {}
+      }
+      try { fs.unlinkSync(dest) } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'artifact write failed and partial file could not be removed')
+      }
+      throw error
     }
-    return dest
   }
 }
 
@@ -167,4 +198,30 @@ export function chatListingOutcome(result) {
   const items = (result && result.items) || []
   const error = (result && (result.lastError || result.error)) || null
   return { items, error, empty: items.length === 0 }
+}
+
+// attachmentVerdict compares the composer's actual attachment set against
+// the exact multiset of requested filenames. Substring presence and page
+// text were permissive on both sides: extras rode along, and a file named
+// "uploading.txt" blocked forever. Unrecognized UI refuses rather than
+// reading as "no attachments".
+export function attachmentVerdict(snapshot, expectedNames) {
+  if (!snapshot || snapshot.known !== true || !Array.isArray(snapshot.files)) {
+    return { error: 'attachment UI unrecognized; refusing submission' }
+  }
+  if (!Array.isArray(expectedNames) || expectedNames.some((n) => typeof n !== 'string')) {
+    throw new TypeError('expectedNames must be an array of filenames')
+  }
+  const files = snapshot.files
+  if (files.some((f) => !f || typeof f.name !== 'string' || !['ready', 'uploading', 'error'].includes(f.state))) {
+    return { error: 'attachment state unrecognized; refusing submission' }
+  }
+  const actual = files.map((f) => f.name).sort()
+  const expected = [...expectedNames].sort()
+  if (actual.length !== expected.length || actual.some((name, i) => name !== expected[i])) {
+    return { error: 'attachment set differs from the files requested for this turn' }
+  }
+  if (files.some((f) => f.state === 'error')) return { error: 'attachment upload failed' }
+  if (files.some((f) => f.state !== 'ready')) return { error: 'attachment upload still in progress' }
+  return { ok: true }
 }

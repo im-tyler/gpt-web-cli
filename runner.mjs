@@ -19,9 +19,12 @@ import {
   positiveInteger,
   listenerPid,
   profileBusyArgv,
+  profileProcessPattern,
   spawnStarted,
   saveArtifact,
   chatListingOutcome,
+  dedupeByFileId,
+  attachmentVerdict,
 } from './core-fixes.mjs'
 
 const jitter = (a, b) => a + Math.random() * (b - a)
@@ -98,7 +101,7 @@ function chromeIsHeadlessBin() {
   try {
     // execFile with an argument vector: the profile path is data, never
     // shell syntax.
-    const out = execFileSync('pgrep', ['-lf', 'user-data-dir=' + PROFILE_DIR], { encoding: 'utf8' })
+    const out = execFileSync('pgrep', ['-lf', profileProcessPattern(PROFILE_DIR)], { encoding: 'utf8' })
     return /--headless/.test(out)
   } catch {
     return false
@@ -165,32 +168,36 @@ function writeDaemonIdentity({ pid, websocketUrl }) {
 
 async function verifyDaemonIdentity() {
   const version = await cdpVersion()
-  if (!version) throw new Error('CDP version lookup failed')
   const ident = readDaemonIdentity()
   const live = {
     profileDir: fs.realpathSync(PROFILE_DIR),
     port: Number(CDP_PORT),
     pid: listenerPid(CDP_PORT),
-    websocketUrl: version.webSocketDebuggerUrl,
+    websocketUrl: version?.webSocketDebuggerUrl,
   }
-  if (!ident) {
-    throw new Error(
-      `no daemon identity recorded for ${CDP_URL} — quit any Chrome on this port and run a command to start this HOME's daemon`
-    )
+  const valid = (value) =>
+    value && typeof value.profileDir === 'string' && value.profileDir.length > 0 &&
+    Number.isSafeInteger(value.port) && value.port > 0 && value.port <= 65535 &&
+    Number.isSafeInteger(value.pid) && value.pid > 0 &&
+    typeof value.websocketUrl === 'string' && value.websocketUrl.length > 0
+  if (!valid(ident) || !valid(live)) {
+    throw new Error("daemon identity is missing or unverifiable — quit any Chrome on this port and run a command to restart this HOME's daemon")
   }
-  if (ident.profileDir !== live.profileDir) {
-    throw new Error(
-      `CDP port ${CDP_PORT} belongs to a daemon on profile ${ident.profileDir}, not this HOME's ${live.profileDir} — quit that Chrome or set CHATGPT_WEB_CDP_PORT`
-    )
+  for (const key of ['profileDir', 'port', 'pid', 'websocketUrl']) {
+    if (ident[key] !== live[key]) throw new Error('daemon identity mismatch: ' + key)
   }
-  if (ident.pid && live.pid && ident.pid !== live.pid) {
-    throw new Error(
-      `CDP port ${CDP_PORT} is held by pid ${live.pid}, but this HOME's daemon was pid ${ident.pid} — a different process owns the endpoint; quit it or use another port`
-    )
+  const endpoint = new URL(live.websocketUrl)
+  if (
+    endpoint.protocol !== 'ws:' ||
+    !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname) ||
+    Number(endpoint.port) !== live.port ||
+    endpoint.username || endpoint.password ||
+    !/^\/devtools\/browser\/[^/]+$/.test(endpoint.pathname) ||
+    endpoint.search || endpoint.hash
+  ) {
+    throw new Error('unexpected browser WebSocket endpoint')
   }
-  if (ident.websocketUrl && version.webSocketDebuggerUrl && ident.websocketUrl !== version.webSocketDebuggerUrl) {
-    throw new Error('CDP endpoint identity changed since this HOME started its daemon — restart the daemon')
-  }
+  return live
 }
 
 async function ensureBrowser() {
@@ -201,9 +208,9 @@ async function ensureBrowser() {
         'daemon is Chrome --headless (Cloudflare-blocked) — quit it and retry; CHATGPT_WEB_HEADLESS=1 hides a headed window'
       )
     }
-    await verifyDaemonIdentity()
+    const identity = await verifyDaemonIdentity()
     if (wantHeadless()) await hideDaemon()
-    return
+    return identity
   }
   // Startup is serialised: two cold starts racing each spawned Chrome, and
   // the loser diagnosed the winner's not-yet-ready port as a profile
@@ -252,8 +259,9 @@ async function ensureBrowser() {
     },
     { staleMs: 60000, timeoutMs: 120000 }
   )
-  await verifyDaemonIdentity()
+  const identity = await verifyDaemonIdentity()
   if (wantHeadless()) await hideDaemon()
+  return identity
 }
 
 async function ensurePageTarget() {
@@ -268,9 +276,10 @@ async function ensurePageTarget() {
 }
 
 async function withPage(fn) {
-  await ensureBrowser()
-  await ensurePageTarget()
-  const browser = await chromium.connectOverCDP(CDP_URL, { noDefaults: true })
+  const identity = await ensureBrowser()
+  // Connect through the verified browser endpoint, not the mutable HTTP
+  // port; the tab is created through this connection.
+  const browser = await chromium.connectOverCDP(identity.websocketUrl, { noDefaults: true })
   let page = null
   try {
     const context = browser.contexts()[0]
@@ -413,31 +422,45 @@ async function assistantIds(page) {
 // looked only at the button, so a navigation during the ready-wait could
 // submit into whatever page was showing; the fallback Enter press is gone.
 async function sendPromptGuarded(page, { boundUrl, prompt }) {
-  const wantConv = boundUrl ? convIdOf(boundUrl) : null
-  const ok = await page
+  const bound = boundUrl ? new URL(boundUrl) : null
+  const route = bound?.pathname.match(/^\/c\/([0-9a-fA-F-]{8,})\/?$/)
+  if (bound && (bound.origin !== 'https://chatgpt.com' || !route)) {
+    throw new Error('invalid bound conversation URL')
+  }
+  const result = await page
     .evaluate(
-      ([sel, composerSel, wantConv, promptText]) => {
+      ({ wantConv, promptText, selectors }) => {
+        if (location.origin !== 'https://chatgpt.com') return { error: 'unexpected origin' }
+        const current = location.pathname.match(/^\/c\/([0-9a-fA-F-]{8,})\/?$/)
         if (wantConv) {
-          const m = location.pathname.match(/^\/c\/([0-9a-fA-F-]{8,})/)
-          if (!m || m[1] !== wantConv) return { error: 'route changed before submission: ' + location.pathname }
+          if (!current || current[1] !== wantConv) return { error: 'conversation changed before submission' }
+        } else if (location.pathname !== '/' || document.querySelectorAll(selectors.messages).length !== 0) {
+          return { error: 'fresh-chat destination changed before submission' }
         }
-        const composer = document.querySelector(composerSel)
+        const composer = document.querySelector(selectors.composer)
         if (!composer) return { error: 'composer disappeared before submission' }
-        const current = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
-        if (current.replace(/\r\n/g, '\n').trim() !== promptText) {
-          return { error: 'composer no longer holds this prompt' }
+        const text = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
+        if (text.replace(/\r\n/g, '\n').trim() !== promptText) return { error: 'composer changed before submission' }
+        const button = document.querySelector(selectors.submit)
+        if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') {
+          return { error: 'send button is disabled' }
         }
-        const b = document.querySelector(sel)
-        if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') {
-          return { error: 'send button is disabled — prompt was not submitted' }
-        }
-        b.click()
-        return { ok: true }
+        const priorIds = Array.from(document.querySelectorAll(selectors.users), (el) =>
+          el.closest('[' + selectors.idAttr + ']')?.getAttribute(selectors.idAttr)
+        )
+        if (priorIds.some((id) => !id)) return { error: 'cannot identify existing user messages' }
+        button.click()
+        return { ok: true, priorIds }
       },
-      [SUBMIT_SEL, COMPOSER_SEL, wantConv, normPrompt(prompt)]
+      {
+        wantConv: route?.[1] || null,
+        promptText: normPrompt(prompt),
+        selectors: { composer: COMPOSER_SEL, submit: SUBMIT_SEL, messages: MESSAGE_SEL, users: USER_SEL, idAttr: MESSAGE_ID_ATTR },
+      }
     )
     .catch((e) => ({ error: e.message }))
-  if (ok.error) throw new Error('submission guard: ' + ok.error)
+  if (!result?.ok) throw new Error('submission guard: ' + (result?.error || 'unknown result'))
+  return result.priorIds
 }
 
 // assertAcceptedPrompt requires a NEW user message whose full text is this
@@ -488,45 +511,37 @@ async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineM
   throw new Error('the submitted prompt was not observed as a new user message — refusing to wait on or record a reply')
 }
 
-// attachmentsReady inspects the composer's own attachment area, not the
-// page body: transcript mentions of a filename used to satisfy the check,
-// and a file named "uploading.txt" (or transcript text about uploading)
-// blocked it forever.
-async function attachmentsReady(page, names) {
+// readComposerAttachments is the DOM adapter: chips scoped to the
+// composer's own container, each with an explicit state. A container with
+// no chips reports zero attachments (known); an unrecognized layout
+// refuses. Transcript text and toasts are never attachment state.
+async function readComposerAttachments(page) {
   return page
-    .evaluate(
-      (fileList) => {
-        const composer = document.querySelector('#prompt-textarea, textarea[data-id], div[contenteditable="true"]')
-        if (!composer) return { error: 'no composer' }
-        const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement
-        if (!scope) return { error: 'no composer scope' }
-        const scopeText = (scope.innerText || '').trim()
-        const missing = fileList.filter((n) => !scopeText.includes(n))
-        if (missing.length) return { error: 'attachment chips not visible for: ' + missing.join(', ') }
-        if (/uploading|upload failed/i.test(scopeText)) return { error: 'attachment upload still in progress or failed' }
-        return { ok: true }
-      },
-      names
-    )
-    .catch((e) => ({ error: e.message }))
+    .evaluate((composerSel) => {
+      const composer = document.querySelector(composerSel)
+      if (!composer) return { known: false }
+      const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement
+      if (!scope) return { known: false }
+      const chips = Array.from(
+        scope.querySelectorAll('[data-testid*="attach" i], [data-testid*="file" i], [class*="attachment" i]')
+      ).filter((el) => el.closest('[data-message-author-role]') === null)
+      const files = []
+      for (const chip of chips) {
+        const name = (chip.innerText || '').trim().split('\n')[0]?.trim() || ''
+        const text = (chip.innerText || '').toLowerCase()
+        if (!name) continue
+        let state = 'ready'
+        if (/error|failed/.test(text)) state = 'error'
+        else if (/uploading/.test(text) || /\b\d+\s*%\b/.test(text)) state = 'uploading'
+        files.push({ name, state })
+      }
+      return { known: true, files }
+    }, COMPOSER_SEL)
+    .catch(() => ({ known: false }))
 }
 
-async function waitForAttachments(page, names, deadlineMs) {
-  const deadline = Date.now() + deadlineMs
-  let last = null
-  while (Date.now() < deadline) {
-    last = await attachmentsReady(page, names)
-    if (last.ok) {
-      // Two stable snapshots a second apart: a chip list that is still
-      // settling passes once and fails the recheck.
-      await sleep(1000)
-      const again = await attachmentsReady(page, names)
-      if (again.ok) return
-      last = again
-    }
-    await sleep(800)
-  }
-  throw new Error('attachments not ready: ' + (last && last.error ? last.error : 'unknown state'))
+async function attachmentsReady(page, names) {
+  return attachmentVerdict(await readComposerAttachments(page), names)
 }
 
 async function uploadFiles(page, paths) {
@@ -700,9 +715,7 @@ export async function runTurn(jobId, turnId) {
           await uploadFiles(page, job.files)
         } else {
           const ready = await attachmentsReady(page, [])
-          if (ready.error && !/not visible/.test(ready.error)) {
-            throw new Error('unexpected attachments present: ' + ready.error)
-          }
+          if (ready.error) throw new Error('unexpected attachments present: ' + ready.error)
         }
 
         // The upload's menus are when an SPA redirect can land; re-authorise
@@ -713,9 +726,8 @@ export async function runTurn(jobId, turnId) {
           throw new Error('the tab left the fresh chat during preparation — refusing to type into ' + page.url())
         }
 
-        priorUserIds = await userIds(page)
         await typePrompt(page, composer, job.prompt)
-        await sendPromptGuarded(page, { boundUrl: job.url, prompt: job.prompt })
+        priorUserIds = await sendPromptGuarded(page, { boundUrl: job.url, prompt: job.prompt })
         await updateState((st) => {
           st.lastSendAt = Date.now()
         })
@@ -854,6 +866,7 @@ export async function runChats() {
     const outcome = chatListingOutcome(result)
     if (outcome.error) {
       console.error('chats listing failed: ' + outcome.error + (outcome.items.length ? ` (showing ${outcome.items.length} fetched before the failure as a partial result)` : ''))
+      process.exitCode = 1
       if (!outcome.items.length) return
     }
     if (!outcome.items.length) {
@@ -928,13 +941,14 @@ async function captureChatFiles(page, chatId) {
       out.push({ index: i, ok: false, reason: 'no file id' })
       continue
     }
-    if (out.some((f) => f.file && f.file.id === id)) {
-      out.push({ index: i, ok: false, reason: 'duplicate card', duplicateOf: id })
+    const existing = out.find((f) => f.ok && f.file && f.file.id === id)
+    if (existing) {
+      out.push({ index: i, ok: true, file: existing.file, duplicateOf: existing.index })
       continue
     }
     let bytes = null
     try {
-      bytes = await fileBytes(page, resp)
+      bytes = await fileBytes(page, resp, { kind: simple ? 'descriptor' : 'artifact' })
     } catch (e) {
       out.push({ index: i, ok: false, reason: e.message })
       continue
@@ -944,25 +958,27 @@ async function captureChatFiles(page, chatId) {
   return out
 }
 
-async function fileBytes(page, resp) {
-  let bytes = Buffer.from(await resp.body())
-  const ct = resp.headers()['content-type'] || ''
-  if (ct.includes('json')) {
-    let du = null
-    try {
-      du = JSON.parse(bytes.toString('utf8')).download_url
-    } catch {}
-    if (du) {
-      bytes = Buffer.from(
-        await page.evaluate(async (u) => {
-          const r = await fetch(u, { credentials: 'include' })
-          if (!r.ok) throw new Error('download http ' + r.status)
-          return new Uint8Array(await r.arrayBuffer())
-        }, du)
-      )
-    }
+async function fileBytes(page, resp, { kind = 'artifact' } = {}) {
+  const bytes = Buffer.from(await resp.body())
+  if (kind === 'artifact') return bytes // JSON is valid file content, too.
+  if (kind !== 'descriptor') throw new Error('unknown file response kind')
+  let descriptor
+  try {
+    descriptor = JSON.parse(bytes.toString('utf8'))
+  } catch {
+    throw new Error('file descriptor is not valid JSON')
   }
-  return bytes
+  if (typeof descriptor?.download_url !== 'string' || !descriptor.download_url) {
+    throw new Error('file descriptor has no download_url')
+  }
+  const url = new URL(descriptor.download_url, resp.url())
+  if (url.protocol !== 'https:' || url.username || url.password) throw new Error('invalid artifact URL')
+  const values = await page.evaluate(async (href) => {
+    const response = await fetch(href, { credentials: 'same-origin', signal: AbortSignal.timeout(30000) })
+    if (!response.ok) throw new Error('download http ' + response.status)
+    return Array.from(new Uint8Array(await response.arrayBuffer()))
+  }, url.href)
+  return Buffer.from(values)
 }
 
 async function manifestFor(page, chatId) {
@@ -1003,6 +1019,7 @@ export async function runDownload(chatId, what, outdir) {
     try {
       const { selectDownloads } = await import('./core-fixes.mjs')
       picks = selectDownloads(manifest, target)
+      if (target === 'all' || target === undefined) picks = dedupeByFileId(picks)
     } catch (e) {
       // `all` on an incomplete manifest fails loudly; an explicit index
       // owns its own failure. Either way nothing partial is saved silently.
@@ -1058,8 +1075,12 @@ export function pickModelMatch(labels, want) {
 }
 
 async function openModelMenu(page, btn) {
-  await btn.click({ force: true, timeout: 10000 })
   const radios = page.locator('[role="menuitemradio"]')
+  // Idempotent: toggling an already-open menu would close it, leaving the
+  // retry with nothing to select.
+  if ((await radios.count().catch(() => 0)) === 0) {
+    await btn.click({ force: true, timeout: 10000 })
+  }
   await radios.first().waitFor({ state: 'attached', timeout: 8000 }).catch(() => {})
   const n = await radios.count().catch(() => 0)
   if (n === 0) return null
