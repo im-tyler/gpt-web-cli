@@ -12,7 +12,9 @@ import {
   writeJob,
   listJobs,
   reapStale,
-  runningJob,
+  runningJobs,
+  limits,
+  withLock,
   pidAlive,
   sleep,
   readState,
@@ -52,8 +54,12 @@ env: CHATGPT_WEB_HOME=${HOME}
      CHATGPT_WEB_TIMEOUT=<secs per turn, default 300>
      CHATGPT_WEB_CDP_PORT=<default 9777>
      CHATGPT_WEB_HEADLESS=1
+     CHATGPT_WEB_MAX_TABS=<concurrent turns, default 2>
      CHATGPT_WEB_MAX_TURNS_DAY=<default 100>  CHATGPT_WEB_MAX_NEW_CHATS=<per hour, default 6>
-     CHATGPT_WEB_MIN_GAP=<secs between turns, default 8>  CHATGPT_WEB_NOTIFY=0 disables notifications`)
+     CHATGPT_WEB_MIN_GAP=<secs between sends, default 8>  CHATGPT_WEB_NOTIFY=0 disables notifications
+
+Concurrent turns (up to CHATGPT_WEB_MAX_TABS) run in separate tabs of the same
+Chrome window; sends are paced globally, response waits happen in parallel.`)
 }
 
 function spawnRunner(args) {
@@ -66,19 +72,28 @@ function spawnRunner(args) {
   return child
 }
 
-function cmdStart(prompt, files) {
+async function cmdStart(prompt, files) {
   if (!prompt) err('start needs a prompt: chatgpt-web start "prompt" [--file path]')
   for (const f of files) {
     if (!fs.existsSync(f)) err(`no such file: ${f}`)
   }
   ensureDirs()
   reapStale()
-  const r = runningJob()
-  if (r) err(`job ${r.id} is still running — run: chatgpt-web wait ${r.id}`)
-  const s = readState()
-  const lim = checkLimits(s, true)
-  if (lim) err(lim)
-  recordTurn(s, true)
+  const running = runningJobs()
+  const L = limits()
+  if (running.length >= L.maxTabs) {
+    err(
+      `${running.length} turns already running (max ${L.maxTabs}, CHATGPT_WEB_MAX_TABS) — ` +
+        `wait: chatgpt-web wait ${running[0].id}`
+    )
+  }
+  let limErr = null
+  await withLock('state', async () => {
+    const s = readState()
+    limErr = checkLimits(s, true)
+    if (!limErr) recordTurn(s, true)
+  })
+  if (limErr) err(limErr)
   const job = {
     id: newId(),
     status: 'running',
@@ -99,7 +114,7 @@ function cmdStart(prompt, files) {
   console.log(job.id)
 }
 
-function cmdSend(id, text, files) {
+async function cmdSend(id, text, files) {
   if (!id || !text) err('usage: chatgpt-web send <id> "text" [--file path]')
   for (const f of files) {
     if (!fs.existsSync(f)) err(`no such file: ${f}`)
@@ -110,10 +125,21 @@ function cmdSend(id, text, files) {
   if (!job) err(`no such job: ${id}`)
   if (job.status === 'running' || job.status === 'streaming') err(`job ${id} is still running — run: chatgpt-web wait ${id}`)
   if (!job.url) err(`job ${id} never completed a turn (no conversation url) — start a new one`)
-  const s = readState()
-  const lim = checkLimits(s, false)
-  if (lim) err(lim)
-  recordTurn(s, false)
+  const running = runningJobs()
+  const L = limits()
+  if (running.length >= L.maxTabs) {
+    err(
+      `${running.length} turns already running (max ${L.maxTabs}, CHATGPT_WEB_MAX_TABS) — ` +
+        `wait: chatgpt-web wait ${running[0].id}`
+    )
+  }
+  let limErr = null
+  await withLock('state', async () => {
+    const s = readState()
+    limErr = checkLimits(s, false)
+    if (!limErr) recordTurn(s, false)
+  })
+  if (limErr) err(limErr)
   job.files = files.map((f) => path.resolve(f))
   job.status = 'running'
   job.prompt = text
@@ -182,8 +208,8 @@ function cmdList() {
 async function cmdLogin() {
   ensureDirs()
   reapStale()
-  const r = runningJob()
-  if (r) err(`job ${r.id} is running — wait for it first`)
+  const running = runningJobs()
+  if (running.length) err(`jobs running (${running.map((j) => j.id).join(', ')}) — wait for them first`)
   const { runLogin } = await import('./runner.mjs')
   await runLogin()
 }
@@ -219,10 +245,10 @@ const positional = rest.filter((x) => x !== '--stream')
 const [cmd, a, b] = positional
 switch (cmd) {
   case 'start':
-    cmdStart(a, fileArgs)
+    await cmdStart(a, fileArgs)
     break
   case 'send':
-    cmdSend(a, b, fileArgs)
+    await cmdSend(a, b, fileArgs)
     break
   case 'wait':
     await cmdWait(a, b, stream)

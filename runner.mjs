@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn, execSync } from 'node:child_process'
 import { chromium } from 'playwright-core'
-import { PROFILE_DIR, readJob, writeJob, sleep, readState, writeState, limits, dayKey, runningJob } from './jobs.mjs'
+import { PROFILE_DIR, readJob, writeJob, sleep, readState, writeState, limits, dayKey, runningJobs, withLock } from './jobs.mjs'
 
 const jitter = (a, b) => a + Math.random() * (b - a)
 
@@ -147,13 +147,14 @@ async function ensurePageTarget() {
 async function withPage(fn) {
   await ensurePageTarget()
   const browser = await chromium.connectOverCDP(CDP_URL, { noDefaults: true })
+  let page = null
   try {
     const context = browser.contexts()[0]
     if (!context) throw new Error('no default context over CDP')
-    let page = context.pages().find((p) => !p.isClosed() && !String(p.url()).startsWith('chrome://'))
-    if (!page) page = await context.newPage()
+    page = await context.newPage()
     return await fn(page)
   } finally {
+    if (page) await page.close().catch(() => {})
     await browser.close().catch(() => {})
   }
 }
@@ -233,9 +234,9 @@ async function sendPrompt(page) {
 async function uploadFiles(page, paths) {
   const fcP = page.waitForEvent('filechooser', { timeout: 12000 })
   fcP.catch(() => {})
-  await page.locator('[data-testid="composer-plus-btn"]').click({ timeout: 5000 })
+  await page.locator('[data-testid="composer-plus-btn"]').click({ timeout: 30000, force: true })
   await sleep(jitter(600, 1200))
-  await page.getByText(/upload from computer/i).first().click({ timeout: 5000 })
+  await page.getByText(/upload from computer/i).first().click({ timeout: 30000, force: true })
   const fc = await fcP
   await fc.setFiles(paths.map((p) => path.resolve(p)))
   const names = paths.map((p) => path.basename(p))
@@ -295,14 +296,6 @@ function notify(title, body) {
   } catch {}
 }
 
-async function humanPace() {
-  const s = readState()
-  const L = limits()
-  const since = Date.now() - (s.lastTurnEnd || 0)
-  const gap = L.minGapMs + Math.random() * 8000
-  if (since < gap) await sleep(gap - since)
-}
-
 export async function runTurn(jobId) {
   try {
     const job = readJob(jobId)
@@ -311,12 +304,22 @@ export async function runTurn(jobId) {
     await withPage(async (page) => {
       await page.goto(job.url || CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
       const composer = await waitForComposer(page)
-      await humanPace()
-      await sleep(jitter(1500, 4000))
-      if (job.files && job.files.length) await uploadFiles(page, job.files)
-      const before = await page.locator(ASSISTANT_SEL).count()
-      await typePrompt(page, composer, job.prompt)
-      await sendPrompt(page)
+      let before = 0
+      await withLock('send', async () => {
+        const s = readState()
+        const L = limits()
+        const since = Date.now() - (s.lastSendAt || s.lastTurnEnd || 0)
+        const gap = L.minGapMs + Math.random() * 8000
+        if (since < gap) await sleep(gap - since)
+        await sleep(jitter(1500, 4000))
+        if (job.files && job.files.length) await uploadFiles(page, job.files)
+        before = await page.locator(ASSISTANT_SEL).count()
+        await typePrompt(page, composer, job.prompt)
+        await sendPrompt(page)
+        const s2 = readState()
+        s2.lastSendAt = Date.now()
+        writeState(s2)
+      })
       let lastPartial = 0
       const reply = await waitForReply(page, before, (partial) => {
         if (Date.now() - lastPartial < 2000) return
@@ -553,12 +556,16 @@ export async function runStatus() {
   const s = readState()
   const L = limits()
   const hourChats = (s.newChats || []).filter((t) => Date.now() - t < 3600000).length
+  const rs = runningJobs()
   console.log(
     `usage: ${(s.turns || {})[dayKey()] || 0}/${L.maxTurnsDay} turns today, ` +
-      `${hourChats}/${L.maxNewChatsHour} new chats this hour, min gap ${L.minGapMs / 1000}s`
+      `${hourChats}/${L.maxNewChatsHour} new chats this hour, min gap ${L.minGapMs / 1000}s, ` +
+      `max ${L.maxTabs} concurrent`
   )
-  const r = runningJob()
-  console.log('running job:', r ? r.id + ' — ' + (r.prompt || '').slice(0, 50) : 'none')
+  console.log(
+    'running jobs:',
+    rs.length ? rs.map((j) => j.id + ' — ' + (j.prompt || '').slice(0, 40)).join(' | ') : 'none'
+  )
   if (up) {
     await withPage(async (page) => {
       await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })

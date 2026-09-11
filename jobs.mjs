@@ -65,10 +65,37 @@ export function pidAlive(pid) {
   }
 }
 
-export function runningJob() {
-  return (
-    listJobs().find((j) => (j.status === 'running' || j.status === 'streaming') && pidAlive(j.pid)) || null
-  )
+export function runningJobs() {
+  return listJobs().filter((j) => (j.status === 'running' || j.status === 'streaming') && pidAlive(j.pid))
+}
+
+export const LOCKS_DIR = path.join(HOME, 'locks')
+
+export async function withLock(name, fn, { staleMs = 120000, timeoutMs = 600000 } = {}) {
+  fs.mkdirSync(LOCKS_DIR, { recursive: true })
+  const dir = path.join(LOCKS_DIR, name + '.lock')
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    try {
+      fs.mkdirSync(dir)
+      fs.writeFileSync(path.join(dir, 'owner.json'), JSON.stringify({ pid: process.pid, at: Date.now() }))
+      break
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e
+      try {
+        if (Date.now() - fs.statSync(dir).mtimeMs > staleMs) fs.rmSync(dir, { recursive: true, force: true })
+      } catch {}
+      if (Date.now() > deadline) throw new Error('lock timeout: ' + name)
+      await sleep(500 + Math.random() * 500)
+    }
+  }
+  try {
+    return await fn()
+  } finally {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+    } catch {}
+  }
 }
 
 export function reapStale() {
@@ -107,6 +134,7 @@ export function limits() {
     maxNewChatsHour: parseInt(process.env.CHATGPT_WEB_MAX_NEW_CHATS || '6', 10),
     maxTurnsDay: parseInt(process.env.CHATGPT_WEB_MAX_TURNS_DAY || '100', 10),
     minGapMs: parseInt(process.env.CHATGPT_WEB_MIN_GAP || '8', 10) * 1000,
+    maxTabs: parseInt(process.env.CHATGPT_WEB_MAX_TABS || '2', 10),
   }
 }
 
