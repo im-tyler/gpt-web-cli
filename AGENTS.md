@@ -1,6 +1,6 @@
 # gpt-web-cli
 
-`chatgpt-web` — CLI for driving ChatGPT from a terminal agent. Repo: `Tyler/gpt-web-cli` (Forgejo-only, PRIVATE). Bin is npm-linked globally (`~/.local/bin/chatgpt-web`).
+`chatgpt-web` — CLI for driving ChatGPT from a terminal agent. Repo: `Tyler/gpt-web-cli` (Forgejo) with public GitHub mirror `im-tyler/gpt-web-cli` (remote `github`). Bin is npm-linked globally (`~/.local/bin/chatgpt-web`).
 
 ## Commands
 
