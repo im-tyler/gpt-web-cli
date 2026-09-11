@@ -318,11 +318,38 @@ async function ensureFreshChat(page) {
   for (let attempt = 0; attempt < 3; attempt++) {
     await sleep(jitter(1500, 2500))
     if (await freshChatReady(page)) return
+    if (!convIdOf(page.url())) {
+      const mounted = await page.locator(MESSAGE_SEL).count().catch(() => 0)
+      if (mounted === 0) {
+        const composer = page.locator(COMPOSER_SEL).first()
+        if ((await composer.count().catch(() => 0)) > 0) {
+          await composer.click({ force: true }).catch(() => {})
+          await page.keyboard
+            .press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
+            .catch(() => {})
+          await page.keyboard.press('Backspace').catch(() => {})
+          const clearDeadline = Date.now() + 5000
+          while (Date.now() < clearDeadline) {
+            if (await freshChatReady(page)) return
+            await sleep(500)
+          }
+        }
+      }
+    }
     const newChat = page.locator(NEW_CHAT_SEL).first()
-    if ((await newChat.count().catch(() => 0)) === 0) continue
-    await newChat.click({ force: true, timeout: 10000 }).catch(() => {})
-    const deadline = Date.now() + 10000
-    while (Date.now() < deadline) {
+    if ((await newChat.count().catch(() => 0)) > 0) {
+      await newChat.click({ force: true, timeout: 10000 }).catch(() => {})
+      const deadline = Date.now() + 10000
+      while (Date.now() < deadline) {
+        if (await freshChatReady(page)) return
+        await sleep(500)
+      }
+    }
+    await page.keyboard
+      .press(process.platform === 'darwin' ? 'Meta+Shift+O' : 'Control+Shift+O')
+      .catch(() => {})
+    const shortcutDeadline = Date.now() + 10000
+    while (Date.now() < shortcutDeadline) {
       if (await freshChatReady(page)) return
       await sleep(500)
     }
@@ -513,7 +540,7 @@ async function sendPrompt(page) {
       return !!b && b.getAttribute('aria-disabled') !== 'true' && b.disabled !== true
     },
     null,
-    { timeout: 8000 }
+    { timeout: 180000 }
   )
   const clicked = await page.evaluate(() => {
     const b = document.querySelector('#composer-submit-button, [data-testid="send-button"]')
@@ -983,6 +1010,131 @@ export async function runStatus() {
       )
     })
   }
+}
+
+// The model picker is the most volatile DOM surface the CLI touches — hence
+// candidate selectors plus a composer-scoped positional fallback, and a clear
+// failure message rather than silence when the UI moves. As of this writing
+// it is a button[aria-haspopup=menu] beside the composer showing the current
+// model's short name, with no stable testid.
+const MODEL_BTN_CANDIDATES = [
+  '[data-testid="model-switcher-dropdown-button"]',
+  '#model-switcher-dropdown-button',
+]
+
+async function modelButton(page) {
+  for (const sel of MODEL_BTN_CANDIDATES) {
+    const loc = page.locator(sel).first()
+    if ((await loc.count().catch(() => 0)) > 0) return loc
+  }
+  // Composer-scoped: the menu-opener inside the composer's container. This
+  // excludes the profile menu and sidebar "More", which live elsewhere, and
+  // the sibling pills that are not the model picker ("Thinking effort",
+  // tools, attach). The found element is marked so the rest of the command
+  // can use a locator.
+  await page.evaluate(() => {
+    const composer = document.querySelector('#prompt-textarea, div[contenteditable="true"]')
+    if (!composer) return
+    const notModel = /more|account|profile|thinking|effort|tools|attach/i
+    for (let el = composer.closest('form') || composer.parentElement; el && el !== document.body; el = el.parentElement) {
+      for (const b of el.querySelectorAll('button[aria-haspopup="menu"]')) {
+        const t = (b.innerText || '').trim()
+        if (t && !notModel.test(t)) {
+          b.setAttribute('data-cgw-model-btn', '1')
+          return
+        }
+      }
+    }
+  })
+  return page.locator('[data-cgw-model-btn="1"]').first()
+}
+
+// pickModelMatch resolves a user's fragment against the menu labels:
+// exactly one substring hit selects, several hits ask for more specificity,
+// none lists what exists.
+export function pickModelMatch(labels, want) {
+  const w = normText(want).toLowerCase()
+  const hits = labels.filter((l) => normText(l).toLowerCase().includes(w))
+  if (hits.length === 1) return { label: hits[0] }
+  if (hits.length > 1) {
+    return { error: `"${want}" matches ${hits.length} models: ${hits.join(' | ')} — be more specific` }
+  }
+  return { error: `no model matches "${want}"` }
+}
+
+// runModel lists or sets the account's model. Selection is manual only: the
+// web UI's "retry with a faster model" banners are information for the user,
+// never a trigger the CLI acts on. ChatGPT persists the choice for future
+// chats, so this is a switch, not a per-turn option.
+// openModelMenu force-clicks the picker and returns the radio-item labels
+// plus their locator, or null when the menu cannot be read. The checked
+// index is included: it is the only trustworthy statement of the current
+// model (the pill's label can be anything).
+async function openModelMenu(page, btn) {
+  await btn.click({ force: true, timeout: 10000 })
+  const radios = page.locator('[role="menuitemradio"]')
+  await radios.first().waitFor({ state: 'attached', timeout: 8000 }).catch(() => {})
+  const n = await radios.count().catch(() => 0)
+  if (n === 0) return null
+  const labels = []
+  for (let i = 0; i < n; i++) {
+    const t = normText(await radios.nth(i).innerText().catch(() => ''))
+    labels.push(t)
+  }
+  const checked = await radios
+    .evaluateAll((els) => els.findIndex((e) => e.getAttribute('data-state') === 'checked'))
+    .catch(() => -1)
+  return { labels, checked, radios }
+}
+
+export async function runModel(want) {
+  await ensureBrowser()
+  await withPage(async (page) => {
+    await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await waitForComposer(page)
+    const btn = await modelButton(page)
+    if (!btn || (await btn.count().catch(() => 0)) === 0) {
+      throw new Error('model picker not found — the web UI changed; update modelButton in runner.mjs')
+    }
+    const menu = await openModelMenu(page, btn)
+    if (!menu || !menu.labels.filter(Boolean).length) {
+      await page.keyboard.press('Escape').catch(() => {})
+      throw new Error('model menu opened but listed no models — the web UI changed')
+    }
+    if (!want) {
+      menu.labels.forEach((l, i) => console.log((i === menu.checked ? '* ' : '  ') + l))
+      await page.keyboard.press('Escape').catch(() => {})
+      return
+    }
+    const pick = pickModelMatch(menu.labels.filter(Boolean), want)
+    if (pick.error) {
+      console.error(pick.error)
+      if (!pick.error.includes('matches ')) menu.labels.filter(Boolean).forEach((l) => console.error('  ' + l))
+      await page.keyboard.press('Escape').catch(() => {})
+      process.exitCode = 1
+      return
+    }
+    // Selection is verified by the menu's own checked state, never by the
+    // pill's label — and retried once, because a force-click into a Radix
+    // popover occasionally does not take.
+    let applied = false
+    for (let attempt = 0; attempt < 2 && !applied; attempt++) {
+      const items = (await openModelMenu(page, btn)) || menu
+      const idx = items.labels.findIndex((l) => l === pick.label)
+      if (idx < 0) break
+      await items.radios.nth(idx).click({ force: true, timeout: 10000 })
+      await sleep(1500)
+      const check = (await openModelMenu(page, btn)) || items
+      applied = check.labels[check.checked] === pick.label
+      await page.keyboard.press('Escape').catch(() => {})
+    }
+    if (!applied) {
+      console.error(`could not confirm "${pick.label}" was selected — check the picker manually`)
+      process.exitCode = 1
+      return
+    }
+    console.log(`model set: ${pick.label}`)
+  })
 }
 
 const [cmd, arg] = process.argv.slice(2)

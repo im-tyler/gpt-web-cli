@@ -19,6 +19,8 @@ chatgpt-web send <id> "follow-up"         # continue the same conversation
 chatgpt-web start "prompt" --file a.png   # attach files
 chatgpt-web list                          # CLI jobs
 chatgpt-web chats                         # account conversations
+chatgpt-web model                         # list available models
+chatgpt-web model "5.2 thinking"          # switch (manual only, persists)
 chatgpt-web files <chat-id>               # list file artifacts from a chat
 chatgpt-web download <chat-id> [n|all]    # download them
 chatgpt-web status                        # daemon, session, usage vs caps

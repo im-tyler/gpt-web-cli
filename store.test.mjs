@@ -175,3 +175,14 @@ test('withLock cleanup is token-guarded: a displaced holder cannot delete a succ
   // The successor's lock directory must still exist.
   assert.ok(fs.existsSync(dir), 'displaced holder deleted the successor lock')
 })
+
+test('pickModelMatch: unique fragment selects, ambiguity and misses are errors', async () => {
+  const { pickModelMatch } = await import(`./runner.mjs?h=${crypto.randomUUID()}`)
+  const labels = ['GPT-5.2 Thinking — slower, smarter', 'GPT-5.2 — fast', 'o4-mini']
+  assert.equal(pickModelMatch(labels, 'thinking').label, labels[0])
+  assert.equal(pickModelMatch(labels, 'O4-MINI').label, labels[2])
+  const ambiguous = pickModelMatch(labels, '5.2')
+  assert.ok(ambiguous.error.includes('matches 2'))
+  const miss = pickModelMatch(labels, 'gpt-4')
+  assert.ok(miss.error.includes('no model matches'))
+})

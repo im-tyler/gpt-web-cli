@@ -41,6 +41,8 @@ function usage() {
   list                list jobs
   status              daemon, session, usage caps, running job
   chats               list ChatGPT conversations (id, async status, updated, title)
+  model [name]        list the account's models, or set one by name fragment
+                      (manual only — the CLI never switches models on its own)
   files <chat-id>     list files created in a conversation
   download <chat-id> [n|all] [outdir]
                       save conversation files to disk (default: all, current dir)
@@ -342,6 +344,9 @@ switch (cmd) {
     break
   case 'chats':
     await cmdChats()
+    break
+  case 'model':
+    await cmdRunner('runModel', a)
     break
   case 'files':
     await cmdRunner('runFiles', a)
