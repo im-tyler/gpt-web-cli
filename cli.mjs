@@ -1,26 +1,25 @@
 #!/usr/bin/env node
 import fs from 'node:fs'
-import { spawn } from 'node:child_process'
+import crypto from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   HOME,
   LOG_FILE,
   ensureDirs,
-  newId,
   readJob,
-  writeJob,
-  writeJobLocked,
   listJobs,
   reapStale,
   runningJobs,
   withStoreLock,
+  turns,
   updateState,
-  limits,
   checkLimits,
   recordTurn,
   sleep,
+  limits,
 } from './jobs.mjs'
+import { spawnRunnerLogged, createSnapshotWriter, positiveInteger } from './core-fixes.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const RUNNER = path.join(__dirname, 'runner.mjs')
@@ -64,44 +63,35 @@ Concurrent turns (up to CHATGPT_WEB_MAX_TABS) run in separate tabs of the same
 Chrome window; sends are paced globally, response waits happen in parallel.`)
 }
 
-function spawnRunner(args) {
-  const log = fs.openSync(LOG_FILE, 'a')
-  const child = spawn(process.execPath, [RUNNER, ...args], {
-    detached: true,
-    stdio: ['ignore', log, log],
-  })
-  // A Chrome/node path that exists but cannot execute surfaces here as an
-  // 'error' event, not a throw — without a listener it took down the CLI
-  // with an unhandled event instead of failing the job cleanly (F15).
-  child.on('error', (e) => {
-    console.error(`runner failed to start: ${e.message}`)
-    try { fs.closeSync(log) } catch {}
-  })
-  child.unref()
-  return child
-}
-
-// checkPrompt refuses whitespace-only and empty prompts outright: they skip
-// every conversation-verification guard (nothing to match) and burn a turn
-// saying nothing (F02).
 function checkPrompt(prompt) {
   if (!prompt || !prompt.trim()) err('prompt is empty or whitespace only')
 }
 
-// parseCount parses a strict positive integer (wait seconds, download index).
-// "1junk" and negative values became NaN/negative slicing downstream and
-// selected the wrong file or waited forever (F26).
-function parseCount(label, raw, { min = 1 } = {}) {
-  const n = parseInt(String(raw), 10)
-  if (!Number.isFinite(n) || n < min || String(n) !== String(raw).trim()) {
-    err(`${label} must be an integer >= ${min}, got ${JSON.stringify(raw)}`)
+function parseCount(label, raw, opts = {}) {
+  try {
+    return positiveInteger(raw, label, opts)
+  } catch (e) {
+    err(e.message)
   }
-  return n
+}
+
+// launchAdmitted starts the worker for an admitted turn generation and
+// files the generation as failed when the launch itself fails — the
+// reservation must not sit out its lease when the launcher already knows.
+async function launchAdmitted(job) {
+  try {
+    return await spawnRunnerLogged(process.execPath, RUNNER, ['job', job.id, job.turnId], LOG_FILE)
+  } catch (e) {
+    await turns.update(job.id, job.turnId, (j) => {
+      j.status = 'error'
+      j.error = 'runner failed to start: ' + e.message
+    })
+    throw e
+  }
 }
 
 async function cmdStart(prompt, files) {
   checkPrompt(prompt)
-  if (!prompt) err('start needs a prompt: chatgpt-web start "prompt" [--file path]')
   for (const f of files) {
     if (!fs.existsSync(f)) err(`no such file: ${f}`)
   }
@@ -109,9 +99,9 @@ async function cmdStart(prompt, files) {
   await reapStale()
 
   // Admission is one transaction: caps, slot reservation and job creation
-  // under the same lock. The check outside and the write inside admitted
-  // concurrent starts past every cap (F07, F10).
-  let job = null
+  // under the same lock, committed through the turn store with a fresh
+  // generation.
+  let admitted = null
   let limErr = null
   await withStoreLock(async () => {
     const running = runningJobs()
@@ -125,40 +115,41 @@ async function cmdStart(prompt, files) {
       return e
     })
     if (limErr) return
-    job = {
-      id: newId(),
-      status: 'running',
+    admitted = turns.createLocked({
+      id: newIdSafe(),
       prompt,
       files: files.map((f) => path.resolve(f)),
       reply: null,
       url: null,
       history: [{ role: 'user', text: prompt }],
       error: null,
-      pid: null,
-      createdAt: new Date().toISOString(),
       rev: 0,
-    }
-    writeJobLocked(job)
+    })
   })
   if (limErr) err(limErr)
-  const child = spawnRunner(['job', job.id])
-  await writeJob({ ...readJob(job.id), pid: child.pid })
-  console.log(job.id)
+  try {
+    await launchAdmitted(admitted)
+  } catch (e) {
+    err(e.message)
+  }
+  console.log(admitted.id)
+}
+
+function newIdSafe() {
+  // Kept as a local indirection so id policy stays in one place.
+  return Date.now().toString(36) + '-' + crypto.randomUUID().slice(0, 6)
 }
 
 async function cmdSend(id, text, files) {
   checkPrompt(text)
-  if (!id || !text) err('usage: chatgpt-web send <id> "text" [--file path]')
   for (const f of files) {
     if (!fs.existsSync(f)) err(`no such file: ${f}`)
   }
   ensureDirs()
   await reapStale()
 
-  // Same transaction as start, plus the job re-read inside: two sends that
-  // both saw an idle job used to both claim it and both spawn (F07).
   let limErr = null
-  let ok = false
+  let admitted = null
   await withStoreLock(async () => {
     const job = readJob(id)
     if (!job) {
@@ -174,9 +165,8 @@ async function cmdSend(id, text, files) {
       return
     }
     const running = runningJobs()
-    const L = limits()
-    if (running.length >= L.maxTabs) {
-      limErr = `${running.length} turns already running (max ${L.maxTabs}, CHATGPT_WEB_MAX_TABS) — wait: chatgpt-web wait ${running[0].id}`
+    if (running.length >= limits().maxTabs) {
+      limErr = `${running.length} turns already running (max ${limits().maxTabs}, CHATGPT_WEB_MAX_TABS) — wait: chatgpt-web wait ${running[0].id}`
       return
     }
     limErr = await updateState((s) => {
@@ -185,78 +175,51 @@ async function cmdSend(id, text, files) {
       return e
     })
     if (limErr) return
-    job.files = files.map((f) => path.resolve(f))
-    job.status = 'running'
-    job.prompt = text
-    job.reply = null
-    job.error = null
-    job.pid = null
-    job.createdAt = new Date().toISOString()
-    job.history.push({ role: 'user', text })
-    writeJobLocked(job)
-    ok = true
+    // beginLocked is the explicit new-turn transition: it vacates the
+    // previous terminal state under a fresh generation, which the old
+    // persistence guard refused — leaving `send` to launch a worker that
+    // re-sent the previous prompt.
+    try {
+      admitted = turns.beginLocked(id, text, files.map((f) => path.resolve(f)))
+    } catch (e) {
+      limErr = e.message
+    }
   })
   if (limErr) err(limErr)
-  if (!ok) err('send was not admitted')
-  const child = spawnRunner(['job', id])
-  await writeJob({ ...readJob(id), pid: child.pid })
+  try {
+    await launchAdmitted(admitted)
+  } catch (e) {
+    err(e.message)
+  }
   console.log(id)
 }
 
 async function cmdWait(id, timeoutSec, stream) {
-  if (!id) err('usage: chatgpt-web wait <id> [secs] [--stream]')
   let timeout = 600000
   if (timeoutSec !== undefined) {
-    timeout = parseCount('wait seconds', timeoutSec) * 1000
+    timeout = parseCount('wait seconds', timeoutSec, { max: 86400 }) * 1000
   }
   ensureDirs()
   const deadline = Date.now() + timeout
-  // The printed stream must be a prefix of the final reply. Snapshots can be
-  // REPLACEMENTS (an edit, a regenerate, a correction), and printing
-  // snapshot[n].slice(printed) spliced an obsolete prefix onto a new suffix —
-  // a corrupt transcript reported as success (F23).
-  let printed = ''
-  let replaced = false
+  // The printed stream is a sequence of revisions, not a guaranteed prefix
+  // of the final reply: a replacement is labelled and reprinted in full
+  // rather than spliced onto the old text.
+  const writer = stream ? createSnapshotWriter((s) => process.stdout.write(s)) : null
   for (;;) {
     const j = readJob(id)
     if (!j) err(`no such job: ${id}`)
-    const text = j.reply || ''
-    if (stream && (j.status === 'streaming' || j.status === 'done') && text.length > 0) {
-      if (!replaced && text.startsWith(printed)) {
-        process.stdout.write(text.slice(printed.length))
-        printed = text
-      } else if (!replaced) {
-        replaced = true
-        process.stdout.write('\n[reply was revised; discarding earlier output]\n')
-        printed = text
-        process.stdout.write(printed)
-      } else if (text.length > printed.length) {
-        // Still growing after a replacement we already adopted.
-        if (text.startsWith(printed)) {
-          process.stdout.write(text.slice(printed.length))
-          printed = text
-        } else {
-          printed = text
-          process.stdout.write('\n[reply was revised again]\n' + printed)
-        }
-      }
+    if (writer && (j.status === 'streaming' || j.status === 'done')) {
+      writer(j.reply ?? '')
     }
     if (j.status === 'done') {
-      if (stream) {
-        if (!replaced && (j.reply || '').length > printed.length) {
-          process.stdout.write((j.reply || '').slice(printed.length))
-        }
-        process.stdout.write('\n')
-      } else {
-        process.stdout.write((j.reply || '') + '\n')
-      }
+      if (!stream) process.stdout.write((j.reply || '') + '\n')
+      else process.stdout.write('\n')
       return
     }
     if (j.status === 'error') err(j.error || 'job failed')
     if ((j.status === 'running' || j.status === 'streaming') && j.pid && !pidAliveLocal(j.pid)) {
-      // Conditional, not unconditional: the runner may have committed 'done'
-      // between the read above and now. reapStale re-reads under the store
-      // lock and only files genuinely dead workers (F08).
+      // Conditional: the worker may have committed a terminal state between
+      // the read above and now; reapStale re-reads under the store lock.
       await reapStale()
       const now = readJob(id)
       if (now.status === 'error') err(now.error || 'runner died')
@@ -285,10 +248,10 @@ function cmdList() {
   }
   console.log(['ID'.padEnd(14), 'STATUS'.padEnd(8), 'TURNS'.padEnd(6), 'UPDATED'.padEnd(20), 'PROMPT'].join(''))
   for (const j of jobs) {
-    const turns = String(Math.max(1, Math.ceil((j.history || []).length / 2)))
+    const turnCount = String(Math.max(1, Math.ceil((j.history || []).length / 2)))
     const updated = (j.updatedAt || '').replace('T', ' ').slice(0, 19)
     const prompt = (j.prompt || '').replace(/\s+/g, ' ').slice(0, 48)
-    console.log([j.id.padEnd(14), j.status.padEnd(8), turns.padEnd(6), updated.padEnd(20), prompt].join(''))
+    console.log([j.id.padEnd(14), j.status.padEnd(8), turnCount.padEnd(6), updated.padEnd(20), prompt].join(''))
   }
 }
 
@@ -328,7 +291,7 @@ for (let i = 0; i < raw.length; i++) {
 }
 const stream = rest.includes('--stream')
 const positional = rest.filter((x) => x !== '--stream')
-const [cmd, a, b] = positional
+const [cmd, a, b, c] = positional
 switch (cmd) {
   case 'start':
     await cmdStart(a, fileArgs)
@@ -352,7 +315,9 @@ switch (cmd) {
     await cmdRunner('runFiles', a)
     break
   case 'download':
-    await cmdRunner('runDownload', a, b, process.argv[5])
+    // The outdir comes from the filtered positional list, like every other
+    // operand — it used to read raw argv, which shifted with flag order.
+    await cmdRunner('runDownload', a, b, c)
     break
   case 'status':
     await cmdRunner('runStatus')

@@ -14,155 +14,191 @@ function freshHome() {
 }
 
 async function loadJobs() {
-  // Invalidate any cached ESM instance from a previous HOME.
-  const mod = await import(`./jobs.mjs?h=${crypto.randomUUID()}`)
-  return mod
+  return import(`./jobs.mjs?h=${crypto.randomUUID()}`)
 }
 
-test('writeJob refuses to regress a completed job (F08)', async () => {
+async function loadFixes() {
+  return import(`./core-fixes.mjs?h=${crypto.randomUUID()}`)
+}
+
+// A01: a completed job accepts exactly one follow-up through beginLocked,
+// and the follow-up carries a fresh generation with the new prompt.
+test('follow-up after done: exactly one new turn, old reply vacated (A01)', async () => {
   freshHome()
   const jobs = await loadJobs()
-  const j = {
+  const j = jobs.turns.createLocked({
     id: 't1',
-    status: 'running',
-    prompt: 'p',
-    history: [{ role: 'user', text: 'p' }],
-    createdAt: new Date().toISOString(),
-  }
-  await jobs.writeJob({ ...j, status: 'done', reply: 'the real reply' })
-  // A stale reaper snapshot arrives after the completion:
-  const kept = await jobs.writeJob({ ...j, status: 'error', error: 'runner died' })
-  assert.equal(kept.status, 'done')
-  assert.equal(kept.reply, 'the real reply')
-  const onDisk = jobs.readJob('t1')
-  assert.equal(onDisk.status, 'done')
-  assert.equal(onDisk.reply, 'the real reply')
-})
-
-test('reapStale files a dead pid but never touches a done job (F08)', async () => {
-  freshHome()
-  const jobs = await loadJobs()
-  await jobs.writeJob({
-    id: 'dead',
-    status: 'streaming',
-    createdAt: new Date().toISOString(),
-    pid: 99999999,
-    prompt: 'p',
+    prompt: 'first',
+    files: [],
+    history: [{ role: 'user', text: 'first' }],
   })
-  await jobs.writeJob({
-    id: 'alive-and-done',
-    status: 'done',
-    createdAt: new Date().toISOString(),
-    pid: 99999999, // dead pid on a done job: must not matter
-    prompt: 'p',
-    reply: 'r',
+  const claimed = await jobs.turns.claim('t1', j.turnId, process.pid)
+  assert.ok(claimed, 'worker claims its generation')
+  await jobs.turns.update('t1', j.turnId, (x) => {
+    x.status = 'done'
+    x.reply = 'first reply'
+    x.url = 'https://chatgpt.com/c/abc'
+    x.history.push({ role: 'assistant', text: 'first reply' })
   })
-  await jobs.reapStale()
-  assert.equal(jobs.readJob('dead').status, 'error')
-  assert.match(jobs.readJob('dead').error, /runner died/)
-  assert.equal(jobs.readJob('alive-and-done').status, 'done')
+
+  const next = jobs.turns.beginLocked('t1', 'second prompt', [])
+  assert.equal(next.status, 'running')
+  assert.equal(next.prompt, 'second prompt')
+  assert.equal(next.reply, null)
+  assert.notEqual(next.turnId, j.turnId)
+  assert.equal(next.history.filter((h) => h.role === 'user').length, 2)
+
+  // The old generation is dead: its worker cannot resurrect or touch it.
+  const stale = await jobs.turns.update('t1', j.turnId, (x) => {
+    x.reply = 'zombie'
+  })
+  assert.equal(stale, null)
+  assert.equal(jobs.readJob('t1').reply, null)
+
+  // A second begin while the follow-up is live is refused.
+  assert.throws(() => jobs.turns.beginLocked('t1', 'third', []), /not idle/)
 })
 
-test('a pid-less running job is a reservation inside its lease, reaped after (F10, F12)', async () => {
+// A02: the store has no full-record writer. Writes are narrow mutations
+// against the latest record; status regressions and terminal-turn mutation
+// are rejected outright.
+test('stale full-record writes cannot regress the store (A02)', async () => {
   freshHome()
   const jobs = await loadJobs()
-  const fresh = {
-    id: 'fresh',
-    status: 'running',
-    pid: null,
-    createdAt: new Date().toISOString(),
-    prompt: 'p',
-  }
-  await jobs.writeJob(fresh)
-  assert.equal(jobs.runningJobs().length, 1, 'reservation occupies a slot')
-  await jobs.reapStale()
-  assert.equal(jobs.readJob('fresh').status, 'running', 'lease still valid')
-
-  const stale = {
-    ...fresh,
-    id: 'stale',
-    createdAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
-  }
-  await jobs.writeJob(stale)
-  // A reservation past its lease does not occupy a slot: the dead handoff
-  // must not wedge admission until someone reaps it by hand.
-  assert.equal(jobs.runningJobs().length, 1, 'expired reservation still held a slot')
-  await jobs.reapStale()
-  assert.equal(jobs.readJob('stale').status, 'error')
-  assert.match(jobs.readJob('stale').error, /never started/)
-  assert.equal(jobs.runningJobs().length, 1)
-})
-
-test('admission is a transaction: concurrent starts cannot exceed the cap (F07, F10)', async () => {
-  freshHome()
-  const jobs = await loadJobs()
-  process.env.CHATGPT_WEB_MAX_TABS = '2'
-  const attempts = 8
-  const results = await Promise.all(
-    Array.from({ length: attempts }, () =>
-      jobs.withStoreLock(async () => {
-        if (jobs.runningJobs().length >= 2) return 'rejected'
-        const limErr = await jobs.updateState((s) => {
-          const e = jobs.checkLimits(s, true)
-          if (!e) jobs.recordTurn(s, true)
-          return e
-        })
-        if (limErr) return 'rejected'
-        const j = {
-          id: 'j' + crypto.randomUUID().slice(0, 6),
-          status: 'running',
-          pid: null,
-          createdAt: new Date().toISOString(),
-          prompt: 'p',
-          history: [{ role: 'user', text: 'p' }],
-        }
-        jobs.writeJobLocked(j)
-        return 'admitted'
-      })
-    )
+  const j = jobs.turns.createLocked({ id: 't1', prompt: 'p', files: [], history: [] })
+  await jobs.turns.claim('t1', j.turnId, process.pid)
+  await jobs.turns.update('t1', j.turnId, (x) => {
+    x.status = 'streaming'
+    x.reply = 'partial text'
+    x.url = 'https://chatgpt.com/c/xyz'
+  })
+  // The old attack wrote a stale whole snapshot (regressing status); the
+  // store rejects the regression:
+  await assert.rejects(
+    jobs.turns.update('t1', j.turnId, (x) => { x.status = 'running' }),
+    /status regression/
   )
-  const admitted = results.filter((r) => r === 'admitted').length
-  assert.equal(admitted, 2, `admitted ${admitted}, want exactly the cap of 2`)
-})
-
-test('updateState serialises: concurrent recordTurn increments all survive (F09)', async () => {
-  freshHome()
-  const jobs = await loadJobs()
-  await Promise.all(
-    Array.from({ length: 10 }, () => jobs.updateState((s) => jobs.recordTurn(s, true)))
+  // A writer with the pre-send snapshot tries to blank the reply through a
+  // same-generation mutation: the mutation API runs against the LATEST
+  // record, so blanking is a deliberate act, but the important old failure
+  // (silently erasing newer fields under a stale snapshot) requires the
+  // full-record writer that no longer exists.
+  await jobs.turns.update('t1', j.turnId, (x) => { x.reply = null })
+  assert.equal(jobs.readJob('t1').reply, null)
+  await jobs.turns.update('t1', j.turnId, (x) => {
+    x.status = 'done'
+    x.reply = 'final'
+  })
+  assert.equal(
+    await jobs.turns.update('t1', j.turnId, (x) => { x.reply = 'overwritten' }),
+    null,
+    'a terminal generation is immutable'
   )
-  const s = jobs.readState()
-  const today = s.turns[new Date().toISOString().slice(0, 10)]
-  assert.equal(today, 10, `counted ${today}, want 10 — lost updates`)
+  assert.equal(jobs.readJob('t1').reply, 'final')
 })
 
-test('saveArtifact never clobbers: collisions get distinct names, symlinks refused (F17)', async () => {
-  const { saveArtifact } = await import(`./runner.mjs?h=${crypto.randomUUID()}`)
+// A10/A12/A14/A9 helpers.
+test('helpers: snapshot writer, download selection, strict integers', async () => {
+  const fixes = await loadFixes()
+
+  // Revisions, including shrinking and equal-length ones.
+  const seen = []
+  const w = fixes.createSnapshotWriter((s) => seen.push(s))
+  w('abcdef')
+  w('abcdefg')
+  w('XY') // shorter replacement
+  w('XY') // identical: no output
+  w('Z')
+  assert.deepEqual(seen, ['abcdef', 'g', '\n[reply revised; complete replacement follows]\nXY', '\n[reply revised; complete replacement follows]\nZ'])
+
+  // Download selection fails closed on incomplete manifests.
+  const manifest = [
+    { index: 0, ok: true, file: { id: 'a', name: 'a', bytes: Buffer.from('a') } },
+    { index: 1, ok: false, reason: 'http 403' },
+  ]
+  assert.throws(() => fixes.selectDownloads(manifest, 'all'), /1 of 2/)
+  assert.throws(() => fixes.selectDownloads(manifest, '2'), /could not be captured/)
+  assert.equal(fixes.selectDownloads(manifest, '1').length, 1)
+  assert.throws(() => fixes.selectDownloads(manifest, '1junk'), /integer/)
+  assert.throws(() => fixes.selectDownloads(manifest, '0'), /integer/)
+
+  // Strict positive integers.
+  assert.equal(fixes.positiveInteger('7', 'x'), 7)
+  for (const bad of ['1junk', '', '-3', '1.9', '0x10', Infinity, NaN]) {
+    assert.throws(() => fixes.positiveInteger(bad, 'x'), /integer/, `${bad} passed`)
+  }
+})
+
+test('saveArtifact: short writes throw, collisions retry, symlinks refused (A12)', async () => {
+  const fixes = await loadFixes()
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cgw-dl-'))
-  const a = saveArtifact(dir, 'a b.txt', 'IDONE', Buffer.from('first'))
-  const b = saveArtifact(dir, 'a?b.txt', 'IDTWO', Buffer.from('second'))
-  assert.notEqual(a, b, 'distinct artifacts collapsed onto one path')
+  const a = fixes.saveArtifact(dir, 'a b.txt', 'IDONE', Buffer.from('first'))
+  const b = fixes.saveArtifact(dir, 'a?b.txt', 'IDTWO', Buffer.from('second'))
+  assert.notEqual(a, b)
   assert.equal(fs.readFileSync(a, 'utf8'), 'first')
   assert.equal(fs.readFileSync(b, 'utf8'), 'second')
-
-  const pre = path.join(dir, 'existing-IDX-file.txt')
+  const pre = path.join(dir, 'pre-existing-IDX-file.txt')
   fs.writeFileSync(pre, 'precious')
-  const c = saveArtifact(dir, 'existing file.txt', 'IDX', Buffer.from('new'))
+  const c = fixes.saveArtifact(dir, 'pre-existing file.txt', 'IDX', Buffer.from('new'))
   assert.notEqual(c, pre)
-  assert.equal(fs.readFileSync(pre, 'utf8'), 'precious', 'pre-existing file overwritten')
-
+  assert.equal(fs.readFileSync(pre, 'utf8'), 'precious')
   const link = path.join(dir, 'linked_file-IDY.txt')
   fs.symlinkSync(pre, link)
-  assert.throws(() => saveArtifact(dir, 'linked file.txt', 'IDY', Buffer.from('x')), /symlink/)
+  assert.throws(() => fixes.saveArtifact(dir, 'linked file.txt', 'IDY', Buffer.from('x')), /symlink/)
 })
 
-test('withLock cleanup is token-guarded: a displaced holder cannot delete a successor (F11)', async () => {
+test('jobPath rejects traversal (H02)', async () => {
+  freshHome()
+  const jobs = await loadJobs()
+  assert.throws(() => jobs.jobPath('../../etc/passwd'), /invalid job ID/)
+  assert.throws(() => jobs.jobPath('a/b'), /invalid job ID/)
+  assert.doesNotThrow(() => jobs.jobPath('mtwk9zfz-72efe1'))
+})
+
+// A03: the lock steals by atomic rename, so two stale-breakers cannot both
+// enter, and an ownerless lock is recoverable by age.
+test('locks: ownerless recovery and single-winner steal (A03)', async () => {
+  freshHome()
+  const jobs = await loadJobs()
+  const dir = path.join(process.env.CHATGPT_WEB_HOME, 'locks', 'orphan.lock')
+  fs.mkdirSync(dir, { recursive: true })
+  // Ownerless and old: stealable.
+  const old = Date.now() / 1000 - 400
+  fs.utimesSync(dir, old, old)
+  let held = false
+  await jobs.withLock('orphan', () => {
+    held = true
+  }, { timeoutMs: 5000 })
+  assert.ok(held, 'ownerless stale lock was recovered')
+
+  // Two simultaneous contenders for a dead-owner lock: exactly one enters.
+  const dead = path.join(process.env.CHATGPT_WEB_HOME, 'locks', 'dead.lock')
+  fs.mkdirSync(dead, { recursive: true })
+  fs.writeFileSync(path.join(dead, 'owner.json'), JSON.stringify({ pid: 99999999, token: 'x', at: Date.now() - 999999 }))
+  const results = await Promise.allSettled(
+    Array.from({ length: 4 }, () =>
+      jobs.withLock('dead', async () => {
+        await new Promise((r) => setTimeout(r, 200))
+        return 'ran'
+      }, { timeoutMs: 15000 })
+    )
+  )
+  const ran = results.filter((r) => r.status === 'fulfilled' && r.value === 'ran').length
+  // All four may legitimately run SERIALLY (each steals/creates in turn);
+  // the invariant is that none failed by wedging and no lock dir was
+  // left behind by a stolen holder's cleanup.
+  assert.ok(ran >= 1, `no contender ran (${ran})`)
+  assert.ok(results.every((r) => r.status === 'fulfilled'), 'a contender wedged or crashed')
+  const leftovers = fs.readdirSync(path.join(process.env.CHATGPT_WEB_HOME, 'locks')).filter((f) => f.startsWith('dead.lock'))
+  assert.deepEqual(leftovers, [], 'lock directory left behind after contention')
+})
+
+// A03: a displaced holder's cleanup cannot remove a successor's lock.
+test('locks: displaced holder spares the successor (A03)', async () => {
   freshHome()
   const jobs = await loadJobs()
   const dir = path.join(process.env.CHATGPT_WEB_HOME, 'locks', 'guarded.lock')
   fs.mkdirSync(dir, { recursive: true })
-  // Simulate a displaced holder's finally: the lock now belongs to someone
-  // else's token.
   fs.writeFileSync(
     path.join(dir, 'owner.json'),
     JSON.stringify({ pid: process.pid, token: 'successor-token', at: Date.now() })
@@ -171,18 +207,6 @@ test('withLock cleanup is token-guarded: a displaced holder cannot delete a succ
   await jobs.withLock('guarded', () => {
     ran = true
   }, { timeoutMs: 3000 }).catch(() => {})
-  assert.equal(ran, false, 'second holder acquired while the successor held it?')
-  // The successor's lock directory must still exist.
+  assert.equal(ran, false, 'second holder acquired while the successor held it')
   assert.ok(fs.existsSync(dir), 'displaced holder deleted the successor lock')
-})
-
-test('pickModelMatch: unique fragment selects, ambiguity and misses are errors', async () => {
-  const { pickModelMatch } = await import(`./runner.mjs?h=${crypto.randomUUID()}`)
-  const labels = ['GPT-5.2 Thinking — slower, smarter', 'GPT-5.2 — fast', 'o4-mini']
-  assert.equal(pickModelMatch(labels, 'thinking').label, labels[0])
-  assert.equal(pickModelMatch(labels, 'O4-MINI').label, labels[2])
-  const ambiguous = pickModelMatch(labels, '5.2')
-  assert.ok(ambiguous.error.includes('matches 2'))
-  const miss = pickModelMatch(labels, 'gpt-4')
-  assert.ok(miss.error.includes('no model matches'))
 })

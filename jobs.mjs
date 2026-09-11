@@ -3,6 +3,9 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 
+import { makeTurnStore } from './turn-store.mjs'
+import { jobId, positiveInteger } from './core-fixes.mjs'
+
 export const HOME = process.env.CHATGPT_WEB_HOME || path.join(os.homedir(), '.chatgpt-web')
 export const JOBS_DIR = path.join(HOME, 'jobs')
 export const PROFILE_DIR = path.join(HOME, 'profile')
@@ -11,8 +14,12 @@ export const LOG_FILE = path.join(HOME, 'runner.log')
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 export function ensureDirs() {
-  fs.mkdirSync(JOBS_DIR, { recursive: true })
-  fs.mkdirSync(PROFILE_DIR, { recursive: true })
+  // Private from the start: prompts, replies and paths live under HOME, and
+  // a 022 umask made them 0755/0644 by default.
+  for (const dir of [HOME, JOBS_DIR, PROFILE_DIR, path.join(HOME, 'locks')]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    fs.chmodSync(dir, 0o700)
+  }
 }
 
 export function newId() {
@@ -21,8 +28,8 @@ export function newId() {
 
 function tmpName(p) {
   // Unique per writer: two writers sharing one temp filename renamed each
-  // other's file out from under them (F09). The pid alone is not enough —
-  // a process can run two writers in parallel.
+  // other's file out from under them. The pid alone is not enough — a
+  // process can run two writers in parallel.
   return p + '.' + process.pid + '.' + crypto.randomUUID() + '.tmp'
 }
 
@@ -31,12 +38,15 @@ function tmpName(p) {
 function atomicWriteJSON(p, v) {
   fs.mkdirSync(path.dirname(p), { recursive: true })
   const tmp = tmpName(p)
-  fs.writeFileSync(tmp, JSON.stringify(v, null, 2))
+  fs.writeFileSync(tmp, JSON.stringify(v, null, 2), { mode: 0o600 })
+  fs.chmodSync(tmp, 0o600)
   fs.renameSync(tmp, p)
 }
 
+// jobPath resolves a job id inside JOBS_DIR only. A CLI-supplied id used to
+// be joined unchecked; it must not escape the store.
 export function jobPath(id) {
-  return path.join(JOBS_DIR, id + '.json')
+  return path.join(JOBS_DIR, jobId(id) + '.json')
 }
 
 export function readJob(id) {
@@ -45,42 +55,6 @@ export function readJob(id) {
   } catch {
     return null
   }
-}
-
-// terminal reports whether a job status can no longer change for its turn.
-// A completed job ('done') must never be overwritten by a stale snapshot
-// from a reaper or a waiter that read the job before the runner finished
-// (F08).
-export function isTerminal(job) {
-  return job && (job.status === 'done' || job.status === 'error')
-}
-
-// persistJobGuarded writes a job, refusing to regress a terminal record: if
-// the job on disk is already 'done' and this write would replace it with
-// anything else, the completed record wins and is returned unchanged. Every
-// writer — runner, CLI, reaper — goes through here (directly or via
-// writeJob), which is what makes the refusal hold against all of them (F08).
-function persistJobGuarded(job) {
-  const disk = readJob(job.id)
-  if (disk && disk.status === 'done' && job.status !== 'done') {
-    return disk
-  }
-  job.updatedAt = new Date().toISOString()
-  job.rev = (disk ? disk.rev || 0 : 0) + 1
-  atomicWriteJSON(jobPath(job.id), job)
-  return job
-}
-
-// writeJob persists a job under the store lock. Callers already inside
-// withStoreLock (admission, reaping) must use writeJobLocked instead — the
-// mkdir lock is not reentrant, and re-acquiring it from its own holder
-// deadlocks.
-export async function writeJob(job) {
-  return withStoreLock(() => persistJobGuarded(job))
-}
-
-export function writeJobLocked(job) {
-  return persistJobGuarded(job)
 }
 
 export function listJobs() {
@@ -109,17 +83,15 @@ export function pidAlive(pid) {
   }
 }
 
-// startupLeaseMs bounds how long a job may sit in 'running' with no pid
-// before it is treated as a launch that never happened. The parent installs
-// the runner's pid immediately after spawn; anything older than this is a
-// parent that died in the handoff window (F12).
+// startupLeaseMs bounds how long a job may sit admitted-but-unclaimed
+// before it is treated as a launch that never happened. The worker claims
+// its generation (and records its pid) immediately after spawning; anything
+// older than this is a parent or worker that died in the handoff.
 export const startupLeaseMs = 90 * 1000
 
-// runningJobs counts occupied turn slots. A just-admitted job with no pid
-// yet is an occupied slot — a reservation, not a ghost — so the MAX_TABS
-// check cannot admit a burst that only later discovers the caps (F10). A
-// reservation whose lease expired is reaped first, so a dead handoff cannot
-// wedge a slot forever.
+// runningJobs counts occupied turn slots. An admitted-but-unclaimed job is
+// an occupied slot — a reservation — so the MAX_TABS check cannot admit a
+// burst that only later discovers the caps.
 export function runningJobs() {
   const now = Date.now()
   const out = []
@@ -136,28 +108,61 @@ export function runningJobs() {
 
 export const LOCKS_DIR = path.join(HOME, 'locks')
 
-// withLock runs fn while holding an inter-process mkdir lock. Cleanup is
-// token-guarded: the holder only removes the lock directory in finally if
-// the directory still names its own token — a holder that was displaced by
-// staleness must not delete the successor's lock, which is what let a third
-// contender in (F11).
+// withLock runs fn while holding an inter-process mkdir lock.
+//
+// Stealing a stale lock is done by RENAMING the stale directory aside: the
+// rename is atomic, so exactly one contender wins it, and the others see
+// the directory gone and race for a fresh mkdir. The old read-check-delete
+// sequence let two contenders who both read a dead owner race, with the
+// loser deleting the winner's freshly created lock and entering beside it.
+// A holder displaced by a steal finds its owner.json gone with the renamed
+// directory and removes nothing. An ownerless lock directory (a crash
+// between mkdir and publishing owner.json) is stealable by directory age,
+// so it cannot wedge acquisition forever.
 export async function withLock(name, fn, { staleMs = 120000, timeoutMs = 600000 } = {}) {
   fs.mkdirSync(LOCKS_DIR, { recursive: true })
   const dir = path.join(LOCKS_DIR, name + '.lock')
-  const token = crypto.randomUUID()
   const ownerFile = path.join(dir, 'owner.json')
+  const token = crypto.randomUUID()
   const deadline = Date.now() + timeoutMs
   for (;;) {
     try {
       fs.mkdirSync(dir)
-      fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, token, at: Date.now() }))
+      // Publish owner.json atomically (write a dotfile, rename it in): a
+      // crash between mkdir and publish must not leave a lock that reads
+      // as both ownerless and unparseable.
+      const pending = path.join(dir, '.owner.' + crypto.randomUUID())
+      fs.writeFileSync(pending, JSON.stringify({ pid: process.pid, token, at: Date.now() }), { mode: 0o600 })
+      fs.renameSync(pending, ownerFile)
       break
     } catch (e) {
       if (e.code !== 'EEXIST') throw e
       try {
-        const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'))
-        if (Date.now() - owner.at > staleMs && !pidAlive(owner.pid)) {
-          fs.rmSync(dir, { recursive: true, force: true })
+        let stealable = false
+        try {
+          const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'))
+          // A published owner decides: steal only when it recorded itself
+          // long enough ago AND its pid is gone. The owner's timestamp, not
+          // the directory's mtime — a holder that died the moment it took
+          // the lock is dead regardless of how young the directory is.
+          stealable = Date.now() - (owner.at || 0) > staleMs && !pidAlive(owner.pid)
+        } catch {
+          // No owner published (crash between mkdir and publish): the
+          // directory's age is the only witness.
+          const st = fs.statSync(dir)
+          stealable = Date.now() - st.mtimeMs > staleMs
+        }
+        if (stealable) {
+          // Atomic steal: the rename succeeds for exactly one contender.
+          // The renamed copy is dead evidence; the winner removes it rather
+          // than letting steals accumulate directories forever.
+          const quarantine = dir + '.stale-' + crypto.randomUUID()
+          try {
+            fs.renameSync(dir, quarantine)
+            fs.rmSync(quarantine, { recursive: true, force: true })
+          } catch {
+            // Someone else stole it first; loop for the fresh mkdir.
+          }
         }
       } catch {}
       if (Date.now() > deadline) throw new Error('lock timeout: ' + name)
@@ -172,24 +177,31 @@ export async function withLock(name, fn, { staleMs = 120000, timeoutMs = 600000 
       if (owner && owner.token === token) {
         fs.rmSync(dir, { recursive: true, force: true })
       }
-    } catch {}
+    } catch {
+      // The lock was stolen and renamed away: nothing of ours to remove.
+    }
   }
 }
 
 // withStoreLock serialises every job-store admission and reconciliation
-// decision. Checking liveness or capacity outside it, then writing inside,
-// admitted two runners to one job and five starts under a cap of two — the
-// check and the write have to be one transaction (F07, F10).
+// decision: the check and the write have to be one transaction.
 export function withStoreLock(fn, opts) {
   return withLock('store', fn, opts)
 }
 
-// reapStale files dead workers, conditionally. It runs under the store lock
-// and re-reads the job inside: a runner that committed 'done' and exited
-// between an outside read and this call is seen as terminal and left alone —
-// the old code wrote its stale 'error' snapshot over the completed reply
-// (F08). A pid-less running job inside its startup lease is a handoff in
-// progress, not a failure (F12).
+// The turn store: the only production writer of job records. Writes are
+// narrow mutations scoped to an admitted turnId; full-record writes from a
+// stale snapshot used to erase newer replies, URLs and statuses despite the
+// lock, because the lock serialised the write but not the preceding read.
+export const turns = makeTurnStore({
+  readJob,
+  withStoreLock,
+  commitLocked: (job) => atomicWriteJSON(jobPath(job.id), job),
+})
+
+// reapStale files dead workers, conditionally, inside the store lock. A
+// legacy record from before turn generations (active, no turnId) is filed
+// as an interrupted upgrade rather than mutated as if it were known.
 export async function reapStale() {
   const now = Date.now()
   for (const j of listJobs()) {
@@ -197,19 +209,32 @@ export async function reapStale() {
     await withStoreLock(() => {
       const cur = readJob(j.id)
       if (!cur || (cur.status !== 'running' && cur.status !== 'streaming')) return
-      if (!cur.pid) {
+      if (!cur.turnId) {
         const age = now - Date.parse(cur.createdAt || 0)
         if (age > startupLeaseMs) {
           cur.status = 'error'
-          cur.error = 'runner never started (parent died during handoff)'
-          writeJobLocked(cur)
+          cur.error = 'interrupted upgrade from a pre-generation record'
+          cur.updatedAt = new Date().toISOString()
+          cur.rev = (cur.rev || 0) + 1
+          atomicWriteJSON(jobPath(cur.id), cur)
+        }
+        return
+      }
+      if (!cur.pid) {
+        const age = now - Date.parse(cur.createdAt || 0)
+        if (age > startupLeaseMs) {
+          turns.updateLocked(cur.id, cur.turnId, (job) => {
+            job.status = 'error'
+            job.error = 'runner never claimed its turn'
+          })
         }
         return
       }
       if (!pidAlive(cur.pid)) {
-        cur.status = 'error'
-        cur.error = `runner died (pid ${cur.pid})`
-        writeJobLocked(cur)
+        turns.updateLocked(cur.id, cur.turnId, (job) => {
+          job.status = 'error'
+          job.error = `runner died (pid ${job.pid})`
+        })
       }
     })
   }
@@ -225,10 +250,8 @@ export function readState() {
   }
 }
 
-// updateState is the only way state.json changes. Every field of that file
-// is an accounting decision (caps, pacing, send timestamps), and two
-// processes each doing read-mutate-write on it silently dropped each other's
-// increments (F09).
+// updateState is the only way state.json changes; the mutator runs inside
+// the state lock against freshly read state.
 export async function updateState(mutator) {
   return withLock('state', () => {
     const s = readState()
@@ -243,9 +266,9 @@ export function dayKey(d = new Date()) {
 }
 
 function intEnv(name, fallback, { min = 0 } = {}) {
-  const n = parseInt(process.env[name] || '', 10)
-  if (!Number.isFinite(n) || n < min) return fallback
-  return n
+  const raw = String(process.env[name] || '').trim()
+  if (!/^\d+$/.test(raw)) return fallback
+  return positiveInteger(raw, name, { min })
 }
 
 export function limits() {
