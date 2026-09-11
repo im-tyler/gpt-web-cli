@@ -3,7 +3,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn, execSync } from 'node:child_process'
 import { chromium } from 'playwright-core'
-import { PROFILE_DIR, readJob, writeJob, sleep, readState, writeState, limits, dayKey, runningJobs, withLock } from './jobs.mjs'
+import {
+  PROFILE_DIR,
+  HOME,
+  readJob,
+  writeJob,
+  sleep,
+  limits,
+  withLock,
+  updateState,
+} from './jobs.mjs'
 
 const jitter = (a, b) => a + Math.random() * (b - a)
 
@@ -15,10 +24,13 @@ const CDP_URL = 'http://127.0.0.1:' + CDP_PORT
 const COMPOSER_SEL = '#prompt-textarea, textarea[data-id], div[contenteditable="true"]'
 const ASSISTANT_SEL = '[data-message-author-role="assistant"]'
 const USER_SEL = '[data-message-author-role="user"]'
+const MESSAGE_SEL = '[data-message-author-role]'
+const MESSAGE_ID_ATTR = 'data-message-id'
 const STOP_SEL = '[data-testid="stop-button"], button[aria-label*="stop" i]'
 const SEND_SEL = '[data-testid="send-button"], button[aria-label*="send" i]'
 const LOGIN_SEL = '[data-testid="login-button"], button:has-text("Log in")'
 const NEW_CHAT_SEL = 'nav a[href="/"], [data-testid*="new-chat"] a, a:has-text("New chat")'
+const SUBMIT_SEL = '#composer-submit-button, [data-testid="send-button"]'
 
 function convIdOf(url) {
   const m = String(url || '').match(/\/c\/([0-9a-fA-F-]{8,})/)
@@ -109,6 +121,45 @@ async function cdpAlive() {
   }
 }
 
+// The daemon identity file answers one question on reuse: is the Chrome on
+// this CDP port the one this HOME started, on this profile? A healthy port
+// alone used to be enough to send through whatever profile happened to own
+// it (F13).
+const DAEMON_FILE = path.join(HOME, 'daemon.json')
+
+function readDaemonIdentity() {
+  try {
+    return JSON.parse(fs.readFileSync(DAEMON_FILE, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+async function verifyDaemonIdentity() {
+  const ident = readDaemonIdentity()
+  if (!ident) return
+  if (ident.profileDir && ident.profileDir !== PROFILE_DIR) {
+    throw new Error(
+      `CDP port ${CDP_PORT} belongs to a daemon on profile ${ident.profileDir}, not this HOME's ${PROFILE_DIR} — ` +
+        'quit that Chrome or set CHATGPT_WEB_CDP_PORT for this home'
+    )
+  }
+  if (ident.pid && daemonPid() && ident.pid !== daemonPid()) {
+    // Port is held by a different process than the recorded daemon; not
+    // necessarily wrong after a restart, but combined with a foreign profile
+    // record above it is refused. With the same profile, refresh below.
+  }
+}
+
+function writeDaemonIdentity(pid) {
+  try {
+    fs.writeFileSync(
+      DAEMON_FILE,
+      JSON.stringify({ pid, profileDir: PROFILE_DIR, cdpPort: CDP_PORT, at: Date.now() }, null, 2)
+    )
+  } catch {}
+}
+
 async function ensureBrowser() {
   if (await cdpAlive()) {
     if (chromeIsHeadlessBin()) {
@@ -116,32 +167,51 @@ async function ensureBrowser() {
         'daemon is Chrome --headless (Cloudflare-blocked) — quit it and retry; CHATGPT_WEB_HEADLESS=1 hides a headed window'
       )
     }
+    await verifyDaemonIdentity()
     if (wantHeadless()) await hideDaemon()
     return
   }
-  if (profileBusy()) {
-    throw new Error('chatgpt-web Chrome is open without remote debugging — quit it (Cmd+Q) and retry')
-  }
-  const bin = chromeBinary()
-  if (!bin) throw new Error('no Chrome binary found — set CHATGPT_WEB_CHROME=/path/to/chrome')
-  const args = [
-    '--remote-debugging-port=' + CDP_PORT,
-    '--user-data-dir=' + PROFILE_DIR,
-    '--no-first-run',
-    '--no-default-browser-check',
-    'about:blank',
-  ]
-  const child = spawn(bin, args, { detached: true, stdio: 'ignore' })
-  child.unref()
-  const deadline = Date.now() + 20000
-  while (Date.now() < deadline) {
-    if (await cdpAlive()) {
-      if (wantHeadless()) await hideDaemon()
-      return
+  // Startup is serialised: two cold starts racing each both spawned Chrome
+  // and the loser diagnosed the winner's not-yet-ready port as a profile
+  // without debugging (F14).
+  await withLock('daemon-startup', async () => {
+    if (await cdpAlive()) return
+    if (profileBusy()) {
+      throw new Error('chatgpt-web Chrome is open without remote debugging — quit it (Cmd+Q) and retry')
     }
-    await sleep(300)
-  }
-  throw new Error('chatgpt-web Chrome started but the debugging port never came up')
+    const bin = chromeBinary()
+    if (!bin) throw new Error('no Chrome binary found — set CHATGPT_WEB_CHROME=/path/to/chrome')
+    const args = [
+      '--remote-debugging-port=' + CDP_PORT,
+      '--user-data-dir=' + PROFILE_DIR,
+      '--no-first-run',
+      '--no-default-browser-check',
+      'about:blank',
+    ]
+    const child = spawn(bin, args, { detached: true, stdio: 'ignore' })
+    child.on('error', (e) => {
+      // Exists-but-not-executable surfaces here, not as a throw (F15).
+      throw new Error('Chrome failed to start: ' + e.message)
+    })
+    child.unref()
+    const deadline = Date.now() + 20000
+    while (Date.now() < deadline) {
+      if (await cdpAlive()) {
+        writeDaemonIdentity(daemonPid())
+        return
+      }
+      // Early exit: a Chrome that died immediately should fail now, not run
+      // out the whole readiness window (F15).
+      try {
+        process.kill(child.pid, 0)
+      } catch {
+        throw new Error('chatgpt-web Chrome exited immediately after starting')
+      }
+      await sleep(300)
+    }
+    throw new Error('chatgpt-web Chrome started but the debugging port never came up')
+  }, { staleMs: 60000, timeoutMs: 120000 })
+  if (wantHeadless()) await hideDaemon()
 }
 
 async function ensurePageTarget() {
@@ -228,54 +298,32 @@ async function typePrompt(page, composer, text) {
   await page.keyboard.insertText(text)
 }
 
-async function sendPrompt(page) {
-  await page.waitForFunction(() => {
-    const b = document.querySelector('#composer-submit-button, [data-testid="send-button"]')
-    return b && b.getAttribute('aria-disabled') !== 'true'
-  }, null, { timeout: 8000 })
-  const clicked = await page.evaluate(() => {
-    const b = document.querySelector('#composer-submit-button, [data-testid="send-button"]')
-    if (!b) return false
-    b.click()
-    return true
-  })
-  if (!clicked) await page.keyboard.press('Enter')
+// A fresh-chat view is empty by construction: no conversation route, no
+// mounted transcript, and an empty composer. Treating an unreadable editor
+// as empty made the check fail open exactly when it mattered (F06).
+async function freshChatReady(page) {
+  if (convIdOf(page.url())) return false
+  const mounted = await page.locator(MESSAGE_SEL).count().catch(() => 0)
+  if (mounted > 0) return false
+  const composer = page.locator(COMPOSER_SEL).first()
+  if ((await composer.count().catch(() => 0)) === 0) return false
+  const text = await composer
+    .evaluate((el) => (el.tagName === 'TEXTAREA' ? el.value : el.innerText))
+    .catch(() => null)
+  if (text === null) return false
+  return !text.trim()
 }
 
-async function uploadFiles(page, paths) {
-  const fcP = page.waitForEvent('filechooser', { timeout: 12000 })
-  fcP.catch(() => {})
-  await page.locator('[data-testid="composer-plus-btn"]').click({ timeout: 30000, force: true })
-  await sleep(jitter(600, 1200))
-  await page.getByText(/upload from computer/i).first().click({ timeout: 30000, force: true })
-  const fc = await fcP
-  await fc.setFiles(paths.map((p) => path.resolve(p)))
-  const names = paths.map((p) => path.basename(p))
-  const deadline = Date.now() + 45000
-  while (Date.now() < deadline) {
-    const body = await page.locator('body').innerText().catch(() => '')
-    if (names.every((n) => body.includes(n))) {
-      await sleep(jitter(2000, 3000))
-      return
-    }
-    await sleep(800)
-  }
-  throw new Error('upload never completed (attach chips missing)')
-}
-
-async function ensureFreshChat(page, composer) {
+async function ensureFreshChat(page) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    await sleep(jitter(2000, 3000))
-    if (!convIdOf(page.url())) {
-      const value = await composer.inputValue().catch(() => '')
-      if (!value || !value.trim()) return
-    }
+    await sleep(jitter(1500, 2500))
+    if (await freshChatReady(page)) return
     const newChat = page.locator(NEW_CHAT_SEL).first()
     if ((await newChat.count().catch(() => 0)) === 0) continue
     await newChat.click({ force: true, timeout: 10000 }).catch(() => {})
     const deadline = Date.now() + 10000
     while (Date.now() < deadline) {
-      if (!convIdOf(page.url())) return
+      if (await freshChatReady(page)) return
       await sleep(500)
     }
   }
@@ -305,9 +353,9 @@ async function captureConversationUrl(page, jobId) {
     if (id) {
       const url = page.url()
       const j = readJob(jobId)
-      if (j) {
+      if (j && j.status !== 'error') {
         j.url = url
-        writeJob(j)
+        await writeJob(j)
       }
       return url
     }
@@ -316,57 +364,101 @@ async function captureConversationUrl(page, jobId) {
   throw new Error('conversation url never appeared after send (no /c/<id>)')
 }
 
+// Prompt verification identifies THIS turn: the last user message must be
+// this prompt, not merely contain its first characters — two prompts sharing
+// a preamble, or a short prompt appearing inside an unrelated message, used
+// to pass (F02). Long prompts can render truncated behind "Show more"; for
+// those the full visible prefix must match, and it must be long enough that
+// coincidence is implausible.
 async function verifyPromptLanded(page, prompt) {
-  const prefix = normText(prompt).slice(0, 60)
-  if (!prefix) return
+  const want = normText(prompt)
+  if (!want) throw new Error('reply verification skipped: empty prompt')
   const users = page.locator(USER_SEL)
   const n = await users.count().catch(() => 0)
   if (n === 0) throw new Error('reply verification failed: no user message in conversation')
   const last = normText(await users.last().innerText().catch(() => ''))
-  if (!last.includes(prefix)) {
+  const ok = last === want || (last.length >= 60 && want.startsWith(last))
+  if (!ok) {
     throw new Error(
-      'reply verification failed: conversation does not contain this turn\'s prompt — ' +
+      "reply verification failed: the conversation's last user message is not this turn's prompt — " +
         'refusing to record a possibly foreign reply (conversation cross-talk guard)'
     )
   }
 }
 
-async function waitForReply(page, before, boundUrl, onPartial) {
+// assistantIds snapshots the mounted assistant messages' identities, so the
+// reply can be tracked by WHO it is rather than by counting messages. Counts
+// misidentified a previous turn's answer as this turn's after navigation
+// (F04) and could consume the very response they were waiting for (F05).
+async function assistantIds(page) {
+  return page.locator(ASSISTANT_SEL).evaluateAll((els, attr) =>
+    els.map((el) => el.closest('[' + attr + ']')?.getAttribute(attr) || '').filter(Boolean),
+    MESSAGE_ID_ATTR
+  ).catch(() => [])
+}
+
+async function replyTextById(page, id) {
+  return page
+    .evaluate(
+      ([sel, attr, wantId]) => {
+        const el = document.querySelector(`[${attr}="${wantId}"]`)
+        if (!el) return null
+        const inner = el.querySelector(sel) || el.closest(sel)
+        return inner ? inner.innerText : null
+      },
+      [ASSISTANT_SEL, MESSAGE_ID_ATTR, id]
+    )
+    .catch(() => null)
+}
+
+// waitForReply tracks the first assistant message that did not exist before
+// the send. Drift away from the bound conversation re-navigates and waits
+// for that same message again; a previous turn's answer can never be
+// returned as this one's, no matter what remounts around it.
+async function waitForReply(page, knownIds, boundUrl, onPartial) {
   const boundId = convIdOf(boundUrl)
-  const msgs = page.locator(ASSISTANT_SEL)
-  const onBoundConversation = async () => convIdOf(page.url()) === boundId
+  const known = new Set(knownIds)
+  const onBound = async () => convIdOf(page.url()) === boundId
   const rebind = async () => {
     await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
     await sleep(jitter(1500, 3000))
-    return Math.max(before, await msgs.count().catch(() => 0))
   }
   const started = Date.now()
-  let startedStreak = 0
+
+  let replyId = null
+  let streak = 0
   while (Date.now() - started < TURN_TIMEOUT_MS) {
-    if (!(await onBoundConversation().catch(() => false))) {
-      before = await rebind()
-      startedStreak = 0
-    } else if ((await msgs.count().catch(() => 0)) > before) {
-      startedStreak++
-      if (startedStreak >= 2) break
+    if (!(await onBound().catch(() => false))) {
+      await rebind()
+      streak = 0
+      await sleep(jitter(600, 1200))
+      continue
+    }
+    const ids = await assistantIds(page)
+    const fresh = ids.find((id) => !known.has(id))
+    if (fresh) {
+      streak++
+      if (streak >= 2) {
+        replyId = fresh
+        break
+      }
     } else {
-      startedStreak = 0
+      streak = 0
     }
     await sleep(jitter(600, 1200))
   }
-  if (startedStreak < 2) {
+  if (!replyId) {
     throw new Error(`no response started within ${Math.round(TURN_TIMEOUT_MS / 1000)}s`)
   }
+
   let lastText = ''
   let stable = 0
   while (Date.now() - started < TURN_TIMEOUT_MS) {
-    if (!(await onBoundConversation().catch(() => false))) {
-      before = await rebind()
-      lastText = ''
-      stable = 0
+    if (!(await onBound().catch(() => false))) {
+      await rebind()
       continue
     }
-    const text = await msgs.last().innerText().catch(() => null)
+    const text = await replyTextById(page, replyId)
     if (text !== null && text === lastText && text.trim()) {
       stable++
       const busy = await page.locator(STOP_SEL).count().catch(() => 0)
@@ -379,6 +471,63 @@ async function waitForReply(page, before, boundUrl, onPartial) {
     await sleep(jitter(700, 1300))
   }
   throw new Error('response never finished streaming (raise CHATGPT_WEB_TIMEOUT)')
+}
+
+// uploadFiles waits for the attachments to actually be ready in the
+// composer, not merely for their names to appear somewhere on the page —
+// body text also contains old conversation mentions and error toasts (F21).
+async function uploadFiles(page, paths) {
+  const fcP = page.waitForEvent('filechooser', { timeout: 12000 })
+  fcP.catch(() => {})
+  await page.locator('[data-testid="composer-plus-btn"]').click({ timeout: 30000, force: true })
+  await sleep(jitter(600, 1200))
+  await page.getByText(/upload from computer/i).first().click({ timeout: 30000, force: true })
+  const fc = await fcP
+  await fc.setFiles(paths.map((p) => path.resolve(p)))
+  const names = paths.map((p) => path.basename(p))
+  const deadline = Date.now() + 45000
+  while (Date.now() < deadline) {
+    const body = await page.locator('body').innerText().catch(() => '')
+    const uploading = /uploading|upload failed/i.test(body || '')
+    const allShown = names.every((n) => body.includes(n))
+    if (allShown && !uploading) {
+      await sleep(jitter(2000, 3000))
+      const recheck = await page.locator('body').innerText().catch(() => '')
+      if (names.every((n) => recheck.includes(n)) && !/uploading|upload failed/i.test(recheck)) {
+        return
+      }
+    }
+    await sleep(800)
+  }
+  throw new Error('upload never completed (attachments not ready)')
+}
+
+// sendPrompt submits only through an enabled button: both the ARIA state and
+// the native disabled property are checked, because a natively disabled
+// button without aria-disabled still received the click and the send was
+// reported as made (F25).
+async function sendPrompt(page) {
+  await page.waitForFunction(
+    () => {
+      const b = document.querySelector('#composer-submit-button, [data-testid="send-button"]')
+      return !!b && b.getAttribute('aria-disabled') !== 'true' && b.disabled !== true
+    },
+    null,
+    { timeout: 8000 }
+  )
+  const clicked = await page.evaluate(() => {
+    const b = document.querySelector('#composer-submit-button, [data-testid="send-button"]')
+    if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') return false
+    b.click()
+    return true
+  })
+  if (!clicked) {
+    const btn = page.locator(SUBMIT_SEL).first()
+    if (!(await btn.isEnabled().catch(() => false))) {
+      throw new Error('send button is disabled — prompt was not submitted')
+    }
+    await page.keyboard.press('Enter')
+  }
 }
 
 function notify(title, body) {
@@ -398,55 +547,94 @@ export async function runTurn(jobId) {
     await ensureBrowser()
     await withPage(async (page) => {
       await page.goto(job.url || CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
-      let composer = await waitForComposer(page)
-      if (job.url) {
-        await assertBoundConversation(page, job)
-        composer = await waitForComposer(page)
-      } else {
-        await ensureFreshChat(page, composer)
-        composer = await waitForComposer(page)
-      }
-      let before = 0
+      await waitForComposer(page)
+
+      let boundUrl = job.url || null
+      let knownIds = []
+      let reply = null
+
+      // Everything that authorises the destination — fresh-chat enforcement,
+      // conversation binding, prompt typing, submission — happens inside the
+      // send critical section, after pacing and uploads. Guards that ran
+      // before the lock expired by submission time: an SPA resume during the
+      // pacing window sent the prompt into a foreign conversation and
+      // verified it there, because the prompt really had landed (F01).
       await withLock('send', async () => {
-        const s = readState()
+        const s = await updateState((st) => st)
         const L = limits()
         const since = Date.now() - (s.lastSendAt || s.lastTurnEnd || 0)
         const gap = L.minGapMs + Math.random() * 8000
         if (since < gap) await sleep(gap - since)
         await sleep(jitter(1500, 4000))
+
+        const composer = await waitForComposer(page)
+        if (job.url) {
+          await assertBoundConversation(page, job)
+        } else {
+          await ensureFreshChat(page)
+        }
         if (job.files && job.files.length) await uploadFiles(page, job.files)
-        before = await page.locator(ASSISTANT_SEL).count()
+
+        // The upload's menus and file dialogs are exactly when an SPA
+        // redirect can land; re-authorise the destination before typing.
+        if (job.url) {
+          await assertBoundConversation(page, job)
+        } else if (convIdOf(page.url())) {
+          throw new Error(
+            'the tab left the fresh chat during preparation — refusing to type into ' + page.url()
+          )
+        }
+
+        knownIds = await assistantIds(page)
         await typePrompt(page, composer, job.prompt)
         await sendPrompt(page)
-        const s2 = readState()
-        s2.lastSendAt = Date.now()
-        writeState(s2)
+        await updateState((st) => {
+          st.lastSendAt = Date.now()
+        })
       })
-      const boundUrl = job.url || (await captureConversationUrl(page, jobId))
+
+      if (!boundUrl) boundUrl = await captureConversationUrl(page, jobId)
+
+      // Partial output is published only after the conversation has been
+      // verified to contain this turn's prompt; an unverified snapshot used
+      // to stream foreign text into the job and stay there after a failed
+      // final check (F03).
+      let verifiedOnce = false
       let lastPartial = 0
-      const reply = await waitForReply(page, before, boundUrl, (partial) => {
+      reply = await waitForReply(page, knownIds, boundUrl, async (partial) => {
+        if (!verifiedOnce) {
+          if (convIdOf(page.url()) !== convIdOf(boundUrl)) return
+          try {
+            await verifyPromptLanded(page, job.prompt)
+            verifiedOnce = true
+          } catch {
+            return
+          }
+        }
         if (Date.now() - lastPartial < 2000) return
         lastPartial = Date.now()
         const j = readJob(jobId)
         if (j && j.status !== 'error') {
           j.status = 'streaming'
           j.reply = partial
-          writeJob(j)
+          await writeJob(j)
         }
       })
+
       if (convIdOf(page.url()) !== convIdOf(boundUrl)) {
         await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
         await sleep(jitter(1500, 3000))
       }
       await verifyPromptLanded(page, job.prompt)
-      const url = boundUrl
       const j = readJob(jobId)
-      j.status = 'done'
-      j.reply = reply
-      j.url = url
-      j.error = null
-      j.history.push({ role: 'assistant', text: reply })
-      writeJob(j)
+      if (j && j.status !== 'error') {
+        j.status = 'done'
+        j.reply = reply
+        j.url = boundUrl
+        j.error = null
+        j.history.push({ role: 'assistant', text: reply })
+        await writeJob(j)
+      }
       notify('chatgpt-web: done', reply.slice(0, 90))
     })
   } catch (e) {
@@ -456,13 +644,13 @@ export async function runTurn(jobId) {
     if (j) {
       j.status = 'error'
       j.error = msg
-      writeJob(j)
+      await writeJob(j)
     }
     notify('chatgpt-web: error', msg)
   } finally {
-    const s = readState()
-    s.lastTurnEnd = Date.now()
-    writeState(s)
+    await updateState((st) => {
+      st.lastTurnEnd = Date.now()
+    })
   }
 }
 
@@ -504,6 +692,8 @@ export async function runChats() {
       if (!token) return { error: 'no session token' }
       const items = []
       let offset = 0
+      let lastError = null
+      let hitCap = false
       const limit = 50
       for (;;) {
         const r = await fetch(
@@ -513,16 +703,25 @@ export async function runChats() {
             headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
           }
         )
-        if (!r.ok) return { error: 'conversations http ' + r.status, items }
+        if (!r.ok) {
+          lastError = 'conversations http ' + r.status
+          break
+        }
         const j = await r.json()
         const batch = j.items || []
         items.push(...batch)
-        if (batch.length < limit || items.length >= 200) break
+        if (batch.length < limit || items.length >= 200) {
+          hitCap = items.length >= 200
+          break
+        }
         offset += limit
       }
-      return { items }
+      return { items, lastError, hitCap }
     })
     const items = result.items || []
+    // A failed later page is a partial result and must say so with a nonzero
+    // exit — printing fifty rows and exiting zero presented a truncated
+    // account as the whole truth (F22).
     if (result.error && !items.length) {
       console.error(result.error)
       process.exitCode = 1
@@ -541,16 +740,43 @@ export async function runChats() {
       const title = String(it.title || '').replace(/\s+/g, ' ').slice(0, 60)
       console.log([id.padEnd(idW), String(status).padEnd(10), updated.padEnd(20), title].join(' '))
     }
+    if (result.lastError) {
+      console.error(`partial listing: ${result.lastError} (showing ${items.length} fetched before the failure)`)
+      process.exitCode = 1
+    }
+    if (result.hitCap) {
+      console.error('listing capped at 200 conversations — older chats are not shown')
+    }
   })
 }
 
 const ICON_SEL = '[data-testid="library-file-icon"]'
+const CAPTURE_DEADLINE_MS = 5 * 60 * 1000
 
+// onConversation verifies after every load that the tab still shows the
+// requested conversation — a redirect to another chat used to be invisible
+// to capture, which then clicked and returned whatever that chat showed
+// (F18).
+async function assertChatUrl(page, chatId) {
+  await sleep(3000)
+  if (convIdOf(page.url()) !== chatId) {
+    throw new Error(`left the requested conversation (at ${page.url()}) — refusing to capture from it`)
+  }
+}
+
+// captureChatFiles builds a per-card manifest. Both supported response forms
+// are awaited before the single click (the old code armed the second watcher
+// only after the first timed out, and a cache-served second click never
+// re-fired it — F19). Indices are original and stable: a failed capture
+// leaves a hole rather than shifting every later file down (F19).
 async function captureChatFiles(page, chatId) {
   const url = CHAT_URL + 'c/' + chatId
-  const files = []
+  const deadline = Date.now() + CAPTURE_DEADLINE_MS
+  const out = []
   for (let i = 0; ; i++) {
+    if (Date.now() > deadline) throw new Error('file capture exceeded its deadline')
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await assertChatUrl(page, chatId)
     await sleep(6000)
     const icons = await page.locator(ICON_SEL).count().catch(() => 0)
     if (icons === 0) {
@@ -558,20 +784,25 @@ async function captureChatFiles(page, chatId) {
       break
     }
     if (i >= icons) break
-    const respP = page
+
+    const estuaryP = page
       .waitForResponse((r) => /estuary\/content/.test(r.url()), { timeout: 8000 })
       .catch(() => null)
+    const simpleP = page
+      .waitForResponse((r) => /\/files\/.+\/simple/.test(r.url()), { timeout: 8000 })
+      .catch(() => null)
     await page.locator(ICON_SEL).nth(i).click()
-    let resp = await respP
+    let resp = await estuaryP
     let simple = null
+    if (!resp) resp = simple = await simpleP
     if (!resp) {
-      const simpleP = page
-        .waitForResponse((r) => /\/files\/.+\/simple/.test(r.url()), { timeout: 3000 })
-        .catch(() => null)
-      await page.locator(ICON_SEL).nth(i).click()
-      resp = simple = await simpleP
+      out.push({ index: i, ok: false, reason: 'no file response for this card' })
+      continue
     }
-    if (!resp) continue
+    if (!resp.ok()) {
+      out.push({ index: i, ok: false, reason: 'http ' + resp.status() })
+      continue
+    }
     const u = new URL(resp.url())
     let id = u.searchParams.get('id') || ''
     let name = u.searchParams.get('fn') || ''
@@ -582,16 +813,20 @@ async function captureChatFiles(page, chatId) {
         name = j.file_name || name
       } catch {}
     }
-    if (!id || seen(files, id)) continue
-    const bytes = await fileBytes(page, resp)
-    files.push({ id, name: name || id + '.bin', bytes })
-    if (files.length >= icons) break
+    if (!id || out.some((f) => f.file && f.file.id === id)) {
+      out.push({ index: i, ok: false, reason: id ? 'duplicate card' : 'no file id' })
+      continue
+    }
+    let bytes = null
+    try {
+      bytes = await fileBytes(page, resp)
+    } catch (e) {
+      out.push({ index: i, ok: false, reason: e.message })
+      continue
+    }
+    out.push({ index: i, ok: true, file: { id, name: name || id + '.bin', bytes } })
   }
-  return files
-}
-
-function seen(files, id) {
-  return files.some((f) => f.id === id)
+  return out
 }
 
 async function fileBytes(page, resp) {
@@ -606,6 +841,9 @@ async function fileBytes(page, resp) {
       bytes = Buffer.from(
         await page.evaluate(async (u) => {
           const r = await fetch(u, { credentials: 'include' })
+          // An error body saved as the artifact is worse than no artifact:
+          // check the status before reading (F20).
+          if (!r.ok) throw new Error('download http ' + r.status)
           return new Uint8Array(await r.arrayBuffer())
         }, du)
       )
@@ -614,19 +852,67 @@ async function fileBytes(page, resp) {
   return bytes
 }
 
+// manifestFor lists a chat's files, failing loudly when any card could not
+// be captured rather than compacting the successes (F19).
+async function manifestFor(page, chatId) {
+  const manifest = await captureChatFiles(page, chatId)
+  const failed = manifest.filter((m) => !m.ok)
+  if (failed.length === manifest.length && failed.length > 0) {
+    throw new Error(`no file could be captured: ${failed[0].reason}`)
+  }
+  return manifest
+}
+
 export async function runFiles(chatId) {
   if (!chatId) throw new Error('usage: chatgpt-web files <chat-id>')
   await ensureBrowser()
   await withPage(async (page) => {
-    const files = await captureChatFiles(page, chatId)
-    if (!files.length) {
-      console.log('no files')
-      return
-    }
-    files.forEach((f, i) => {
-      console.log(String(i + 1).padEnd(4), f.name.slice(0, 48).padEnd(50), f.id)
+    const manifest = await manifestFor(page, chatId)
+    let shown = 0
+    manifest.forEach((m) => {
+      if (!m.ok) {
+        console.log(String(m.index + 1).padEnd(4), `(capture failed: ${m.reason})`)
+        return
+      }
+      shown++
+      console.log(String(m.index + 1).padEnd(4), m.file.name.slice(0, 48).padEnd(50), m.file.id)
     })
+    if (!shown) console.log('no files')
   })
+}
+
+// saveArtifact writes bytes under a collision-safe, never-clobbering name.
+// Distinct files whose sanitized names collide used to overwrite each other,
+// and so did pre-existing files in the target directory (F17). Symlinked
+// destinations are refused rather than followed.
+export function saveArtifact(dir, name, id, bytes) {
+  const safeBase = name.replace(/[^A-Za-z0-9._-]/g, '_') || 'file'
+  const ext = path.extname(safeBase)
+  const stem = safeBase.slice(0, safeBase.length - ext.length)
+  const idTag = String(id).replace(/[^A-Za-z0-9]/g, '').slice(0, 8)
+  let dest = path.join(dir, `${stem}-${idTag}${ext}`)
+  for (let n = 2; ; n++) {
+    let st
+    try {
+      st = fs.lstatSync(dest)
+    } catch {
+      st = null
+    }
+    if (st && st.isSymbolicLink()) {
+      throw new Error(`refusing to write through symlink ${dest}`)
+    }
+    if (!st) break
+    dest = path.join(dir, `${stem}-${idTag}-${n}${ext}`)
+  }
+  // O_EXCL: the name we settled on is ours alone; no concurrent writer can
+  // slip in between the check above and the create below.
+  const fd = fs.openSync(dest, 'wx')
+  try {
+    fs.writeSync(fd, bytes)
+  } finally {
+    fs.closeSync(fd)
+  }
+  return dest
 }
 
 export async function runDownload(chatId, what, outdir) {
@@ -635,24 +921,36 @@ export async function runDownload(chatId, what, outdir) {
   const dir = outdir || process.cwd()
   await ensureBrowser()
   await withPage(async (page) => {
-    const files = await captureChatFiles(page, chatId)
-    if (!files.length) {
+    const manifest = await manifestFor(page, chatId)
+    const goods = manifest.filter((m) => m.ok)
+    if (!goods.length) {
       console.log('no files')
       return
     }
-    const picks =
-      target === 'all' ? files : files.slice(parseInt(target, 10) - 1, parseInt(target, 10))
-    if (!picks.length) {
-      console.error(`no file #${target} (have ${files.length})`)
-      process.exitCode = 1
-      return
+    let picks
+    if (target === 'all') {
+      picks = goods
+    } else {
+      const n = parseInt(target, 10)
+      if (!Number.isFinite(n) || n < 1 || n > manifest.length) {
+        console.error(`no file #${target} (cards 1..${manifest.length})`)
+        process.exitCode = 1
+        return
+      }
+      // n addresses the card's original position — a hole left by a failed
+      // capture is a hard error for that n, not a silent shift (F19).
+      const entry = manifest[n - 1]
+      if (!entry.ok) {
+        console.error(`file #${n} could not be captured: ${entry.reason}`)
+        process.exitCode = 1
+        return
+      }
+      picks = [entry]
     }
     fs.mkdirSync(dir, { recursive: true })
-    for (const f of picks) {
-      const safe = f.name.replace(/[^A-Za-z0-9._-]/g, '_')
-      const p = path.join(dir, safe)
-      fs.writeFileSync(p, f.bytes)
-      console.log(p, `(${f.bytes.length} bytes)`)
+    for (const m of picks) {
+      const p = saveArtifact(dir, m.file.name, m.file.id, m.file.bytes)
+      console.log(p, `(${m.file.bytes.length} bytes)`)
     }
   })
 }
@@ -661,12 +959,13 @@ export async function runStatus() {
   const up = await cdpAlive()
   const mode = !up ? '' : chromeIsHeadlessBin() ? ', headless' : wantHeadless() ? ', hidden' : ', windowed'
   console.log('daemon:', up ? 'up (CDP port ' + CDP_PORT + mode + ')' : 'down (next command starts it)')
+  const { readState, runningJobs } = await import('./jobs.mjs')
   const s = readState()
   const L = limits()
   const hourChats = (s.newChats || []).filter((t) => Date.now() - t < 3600000).length
   const rs = runningJobs()
   console.log(
-    `usage: ${(s.turns || {})[dayKey()] || 0}/${L.maxTurnsDay} turns today, ` +
+    `usage: ${(s.turns || {})[new Date().toISOString().slice(0, 10)] || 0}/${L.maxTurnsDay} turns today, ` +
       `${hourChats}/${L.maxNewChatsHour} new chats this hour, min gap ${L.minGapMs / 1000}s, ` +
       `max ${L.maxTabs} concurrent`
   )
