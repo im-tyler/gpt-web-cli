@@ -37,6 +37,13 @@ function convIdOf(url) {
   return m ? m[1] : null
 }
 
+function debugLog(...args) {
+  if (process.env.CHATGPT_WEB_DEBUG !== '1') return
+  try {
+    fs.appendFileSync(path.join(HOME, 'debug.log'), new Date().toISOString() + ' ' + args.join(' ') + '\n')
+  } catch {}
+}
+
 function normText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim()
 }
@@ -302,40 +309,28 @@ async function typePrompt(page, composer, text) {
 // mounted transcript, and an empty composer. Treating an unreadable editor
 // as empty made the check fail open exactly when it mattered (F06).
 async function freshChatReady(page) {
-  if (convIdOf(page.url())) return false
+  const conv = convIdOf(page.url())
   const mounted = await page.locator(MESSAGE_SEL).count().catch(() => 0)
-  if (mounted > 0) return false
   const composer = page.locator(COMPOSER_SEL).first()
-  if ((await composer.count().catch(() => 0)) === 0) return false
-  const text = await composer
-    .evaluate((el) => (el.tagName === 'TEXTAREA' ? el.value : el.innerText))
-    .catch(() => null)
-  if (text === null) return false
-  return !text.trim()
+  const ccount = (await composer.count().catch(() => 0)) > 0
+  let text = null
+  if (ccount) {
+    text = await composer
+      .evaluate((el) => (el.tagName === 'TEXTAREA' ? el.value : el.innerText))
+      .catch(() => null)
+  }
+  const verdict = !conv && mounted === 0 && ccount && text !== null
+  debugLog(
+    'freshChatReady',
+    JSON.stringify({ url: page.url(), conv, mounted, ccount, textLen: text === null ? null : text.length, verdict })
+  )
+  return verdict
 }
 
 async function ensureFreshChat(page) {
   for (let attempt = 0; attempt < 3; attempt++) {
     await sleep(jitter(1500, 2500))
     if (await freshChatReady(page)) return
-    if (!convIdOf(page.url())) {
-      const mounted = await page.locator(MESSAGE_SEL).count().catch(() => 0)
-      if (mounted === 0) {
-        const composer = page.locator(COMPOSER_SEL).first()
-        if ((await composer.count().catch(() => 0)) > 0) {
-          await composer.click({ force: true }).catch(() => {})
-          await page.keyboard
-            .press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
-            .catch(() => {})
-          await page.keyboard.press('Backspace').catch(() => {})
-          const clearDeadline = Date.now() + 5000
-          while (Date.now() < clearDeadline) {
-            if (await freshChatReady(page)) return
-            await sleep(500)
-          }
-        }
-      }
-    }
     const newChat = page.locator(NEW_CHAT_SEL).first()
     if ((await newChat.count().catch(() => 0)) > 0) {
       await newChat.click({ force: true, timeout: 10000 }).catch(() => {})
