@@ -42,6 +42,17 @@ export function makeTurnStore({ readJob, commitLocked, withStoreLock, now = () =
       history: [...(old.history || []), { role: 'user', text: prompt }],
     })
   }
+  function resumeLocked(id) {
+    const old = readJob(id)
+    if (!old) throw new Error('no such job: ' + id)
+    if (!terminal(old)) throw new Error('job is not idle: ' + id)
+    if (!old.url) throw new Error('job has no conversation URL')
+    return commit(old, {
+      ...structuredClone(old), turnId: crypto.randomUUID(), status: 'running',
+      reply: null, error: null, pid: null,
+      claimedAt: null, createdAt: now(),
+    })
+  }
   function updateLocked(id, turnId, mutate) {
     const old = readJob(id)
     if (!active(old) || !turnId || old.turnId !== turnId) return null
@@ -63,5 +74,5 @@ export function makeTurnStore({ readJob, commitLocked, withStoreLock, now = () =
       job.claimedAt = now()
     }))
   }
-  return { createLocked, beginLocked, updateLocked, update, claim }
+  return { createLocked, beginLocked, resumeLocked, updateLocked, update, claim }
 }

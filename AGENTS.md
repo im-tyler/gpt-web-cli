@@ -6,6 +6,7 @@
 
 - `start "prompt"` -> prints job id, returns immediately; `--file <path>` (repeatable) attaches files
 - `send <id> "text"` -> follow-up in the same conversation; `--file` works here too
+- `resume <id>` -> retry a failed assistant turn in standard ChatGPT (clicks the thread's own Retry control). NEVER clicks "Use Work": when the Work interstitial gates a conversation, sends/resume fail fast with that explanation — recover by starting a new chat. The interstitial's Retry is inert underneath (verified 2026-09-12); the backend wedges the thread into Work mode.
 - `wait <id> [secs]` -> blocks, prints reply, exit 1 on error (default 600s); `--stream` prints as it grows
 - `list`, `status`, `chats` (account threads via `/backend-api/conversations`, not CLI jobs), `login`
 - `files <chat-id>` / `download <chat-id> [n|all] [outdir]` -> conversation file artifacts

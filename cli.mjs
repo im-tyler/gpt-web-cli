@@ -35,6 +35,7 @@ function usage() {
   start "prompt"      create a job and send the prompt to ChatGPT (prints job id)
                       optional: --file <path> (repeatable) attaches files
   send <id> "text"    send a follow-up in the job's conversation (prints job id)
+  resume <id>         retry a failed assistant turn in standard ChatGPT (never clicks "Use Work")
   wait <id> [secs]    block until the job finishes, print the reply (default 600s)
                       optional: --stream prints the reply as it grows
   list                list jobs
@@ -78,9 +79,9 @@ function parseCount(label, raw, opts = {}) {
 // launchAdmitted starts the worker for an admitted turn generation and
 // files the generation as failed when the launch itself fails — the
 // reservation must not sit out its lease when the launcher already knows.
-async function launchAdmitted(job) {
+async function launchAdmitted(job, mode = 'job') {
   try {
-    return await spawnRunnerLogged(process.execPath, RUNNER, ['job', job.id, job.turnId], LOG_FILE)
+    return await spawnRunnerLogged(process.execPath, RUNNER, [mode, job.id, job.turnId], LOG_FILE)
   } catch (e) {
     await turns.update(job.id, job.turnId, (j) => {
       j.status = 'error'
@@ -194,6 +195,55 @@ async function cmdSend(id, text, files) {
   console.log(id)
 }
 
+// cmdResume retries a failed assistant turn in standard ChatGPT by clicking
+// the conversation's own Retry control. It never clicks "Use Work": the
+// Work interstitial is ChatGPT suggesting a different surface, and the CLI
+// must stay on the surface its selectors are built for.
+async function cmdResume(id) {
+  ensureDirs()
+  await reapStale()
+  let limErr = null
+  let admitted = null
+  await withStoreLock(async () => {
+    const job = readJob(id)
+    if (!job) {
+      limErr = `no such job: ${id}`
+      return
+    }
+    if (job.status === 'running' || job.status === 'streaming') {
+      limErr = `job ${id} is still running — run: chatgpt-web wait ${id}`
+      return
+    }
+    if (!job.url) {
+      limErr = `job ${id} never completed a turn (no conversation url) — start a new one`
+      return
+    }
+    const running = runningJobs()
+    if (running.length >= limits().maxTabs) {
+      limErr = `${running.length} turns already running (max ${limits().maxTabs}, CHATGPT_WEB_MAX_TABS) — wait: chatgpt-web wait ${running[0].id}`
+      return
+    }
+    limErr = await updateState((s) => {
+      const e = checkLimits(s, false)
+      if (!e) recordTurn(s, false)
+      return e
+    })
+    if (limErr) return
+    try {
+      admitted = turns.resumeLocked(id)
+    } catch (e) {
+      limErr = e.message
+    }
+  })
+  if (limErr) err(limErr)
+  try {
+    await launchAdmitted(admitted, 'resume')
+  } catch (e) {
+    err(e.message)
+  }
+  console.log(id)
+}
+
 async function cmdWait(id, timeoutSec, stream) {
   let timeout = 600000
   if (timeoutSec !== undefined) {
@@ -298,6 +348,9 @@ switch (cmd) {
     break
   case 'send':
     await cmdSend(a, b, fileArgs)
+    break
+  case 'resume':
+    await cmdResume(a)
     break
   case 'wait':
     await cmdWait(a, b, stream)

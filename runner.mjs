@@ -69,7 +69,11 @@ function normText(s) {
 
 // Only line endings are normalized for prompt comparison: broad whitespace
 // collapsing can alter code prompts.
-const normPrompt = (s) => String(s || '').replace(/\r\n/g, '\n').trim()
+const normPrompt = (s) =>
+  String(s || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{2,}/g, '\n')
+    .trim()
 
 function debugLog(...args) {
   if (process.env.CHATGPT_WEB_DEBUG !== '1') return
@@ -310,12 +314,34 @@ async function classifyPage(page, deadlineMs = 20000) {
   }
 }
 
+// The Work interstitial ("Use Work") is ChatGPT suggesting a different
+// surface on top of a failed turn. Standard-mode recovery is the failed
+// turn's own Retry control; the CLI never clicks Use Work.
+async function workGateState(page) {
+  return page
+    .evaluate(() => {
+      const visible = (el) => el.offsetParent !== null
+      const retry = document.querySelector('[data-testid="regenerate-thread-error-button"]')
+      const work = Array.from(document.querySelectorAll('button, [role="button"]')).find(
+        (b) => visible(b) && /^Use Work$/i.test((b.innerText || '').trim())
+      )
+      return { retry: !!(retry && visible(retry)), work: !!work }
+    })
+    .catch(() => ({ retry: false, work: false }))
+}
+
 async function waitForComposer(page) {
   const deadline = Date.now() + 45000
   for (;;) {
     const state = await classifyPage(page)
     if (state === 'in') {
-      const el = page.locator(COMPOSER_SEL).first()
+      const gate = await workGateState(page)
+      if (gate.work) {
+        throw new Error(
+          'conversation is gated by the ChatGPT Work prompt — standard-mode use is blocked for this thread; start a new chat (Work is never auto-clicked)'
+        )
+      }
+      const el = await page.locator(COMPOSER_SEL).first()
       if ((await el.count().catch(() => 0)) > 0) return el
     }
     if (state === 'out' || page.url().includes('/auth/')) {
@@ -440,7 +466,8 @@ async function sendPromptGuarded(page, { boundUrl, prompt }) {
         const composer = document.querySelector(selectors.composer)
         if (!composer) return { error: 'composer disappeared before submission' }
         const text = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
-        if (text.replace(/\r\n/g, '\n').trim() !== promptText) return { error: 'composer changed before submission' }
+        const flat = text.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
+        if (flat !== promptText) return { error: 'composer changed before submission' }
         const button = document.querySelector(selectors.submit)
         if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') {
           return { error: 'send button is disabled' }
@@ -463,50 +490,58 @@ async function sendPromptGuarded(page, { boundUrl, prompt }) {
   return result.priorIds
 }
 
-// assertAcceptedPrompt requires a NEW user message whose full text is this
-// prompt. Text alone cannot identify a turn — repeated prompts and
-// truncated renderings both pass it — so the message id must not have
-// existed before the send, and the text must match completely. Where the UI
-// truncates the display, verification fails closed instead of accepting a
-// prefix.
-function assertAcceptedPrompt({ priorIds, currentId, text, prompt }) {
-  if (!currentId) return { error: 'no identified user message' }
-  if (priorIds && priorIds.includes(currentId)) {
-    return { error: 'user message existed before this send' }
-  }
-  const shown = normPrompt(text)
-  const want = normPrompt(prompt)
-  if (shown !== want) {
-    return {
-      error:
-        shown.length < want.length && want.startsWith(shown)
-          ? 'prompt is displayed truncated; cannot verify the full submission — expand or shorten'
-          : 'displayed user message does not match this prompt',
-    }
-  }
-  return { id: currentId }
+// The transcript renders user messages as markdown, so DOM innerText can
+// diverge from the authored prompt (list markers, emphasis, blank-line
+// runs). The conversation API returns the authored parts verbatim; all
+// prompt-identity checks go through it. Ids are the same space as DOM
+// data-message-id (mapping key == message.id).
+async function fetchConversationMessages(page, cid) {
+  return page
+    .evaluate(async (cid) => {
+      const s = await (await fetch('/api/auth/session', { credentials: 'include' })).json()
+      if (!s || !s.accessToken) return { error: 'no access token' }
+      const r = await fetch('/backend-api/conversation/' + cid, {
+        headers: { Authorization: 'Bearer ' + s.accessToken },
+        credentials: 'include',
+      })
+      if (!r.ok) return { error: 'conversation fetch ' + r.status }
+      const j = await r.json()
+      const out = []
+      for (const k of Object.keys(j.mapping || {})) {
+        const m = j.mapping[k].message
+        if (!m || !m.content) continue
+        const role = m.author && m.author.role
+        if (role !== 'user' && role !== 'assistant') continue
+        const parts = (m.content.parts || [])
+          .map((p) => (typeof p === 'string' ? p : p && p.text ? p.text : ''))
+          .filter(Boolean)
+        const text = parts.join('\n')
+        if (!text.trim()) continue
+        out.push({ id: m.id || k, role, create: m.create_time || 0, text })
+      }
+      out.sort((a, b) => a.create - b.create)
+      return { msgs: out }
+    }, cid)
+    .catch((e) => ({ error: e.message }))
 }
 
 async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineMs) {
   const deadline = Date.now() + deadlineMs
+  const cid = convIdOf(boundUrl || page.url())
+  if (!cid) throw new Error('no conversation id to verify the accepted prompt against')
   while (Date.now() < deadline) {
     if (boundUrl && convIdOf(page.url()) !== convIdOf(boundUrl)) {
       await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
       await sleep(jitter(1500, 3000))
     }
-    const snap = await page
-      .locator(USER_SEL)
-      .last()
-      .evaluate((el, attr) => {
-        const container = el.closest('[' + attr + ']')
-        return { currentId: container ? container.getAttribute(attr) : null, text: el.innerText }
-      }, MESSAGE_ID_ATTR)
-      .catch(() => null)
-    if (snap) {
-      const verdict = assertAcceptedPrompt({ priorIds, ...snap, prompt })
-      if (!verdict.error) return verdict.id
+    const got = await fetchConversationMessages(page, cid)
+    if (got && got.msgs) {
+      const hit = got.msgs.find(
+        (m) => m.role === 'user' && normPrompt(m.text) === normPrompt(prompt) && !(priorIds || []).includes(m.id)
+      )
+      if (hit) return hit.id
     }
-    await sleep(800)
+    await sleep(jitter(1500, 2500))
   }
   throw new Error('the submitted prompt was not observed as a new user message — refusing to wait on or record a reply')
 }
@@ -523,13 +558,17 @@ async function readComposerAttachments(page) {
       const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement
       if (!scope) return { known: false }
       const chips = Array.from(
-        scope.querySelectorAll('[data-testid*="attach" i], [data-testid*="file" i], [class*="attachment" i]')
+        scope.querySelectorAll(
+          '[data-testid*="attach" i], [data-testid*="file" i], [class*="attachment" i], [class*="file-tile" i]'
+        )
       ).filter((el) => el.closest('[data-message-author-role]') === null)
       const files = []
+      const seen = new Set()
       for (const chip of chips) {
         const name = (chip.innerText || '').trim().split('\n')[0]?.trim() || ''
         const text = (chip.innerText || '').toLowerCase()
-        if (!name) continue
+        if (!name || seen.has(name)) continue
+        seen.add(name)
         let state = 'ready'
         if (/error|failed/.test(text)) state = 'error'
         else if (/uploading/.test(text) || /\b\d+\s*%\b/.test(text)) state = 'uploading'
@@ -544,15 +583,66 @@ async function attachmentsReady(page, names) {
   return attachmentVerdict(await readComposerAttachments(page), names)
 }
 
+// Polls the composer until the exact requested file set is present and every
+// upload has finished. "Still in progress" and not-yet-rendered chips are
+// transient; a failed upload never recovers, so it fails fast.
+async function waitForAttachments(page, names, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  let lastError = 'attachment UI unrecognized; refusing submission'
+  while (Date.now() < deadline) {
+    const verdict = await attachmentsReady(page, names)
+    if (verdict && verdict.ok) return
+    if (verdict && verdict.error) {
+      if (/attachment upload failed/.test(verdict.error)) throw new Error(verdict.error)
+      lastError = verdict.error
+    }
+    await sleep(jitter(600, 1300))
+  }
+  throw new Error(`attachments not ready after ${timeoutMs}ms: ${lastError}`)
+}
+
 async function uploadFiles(page, paths) {
-  const fcP = page.waitForEvent('filechooser', { timeout: 12000 })
-  fcP.catch(() => {})
-  await page.locator('[data-testid="composer-plus-btn"]').click({ timeout: 30000, force: true })
-  await sleep(jitter(600, 1200))
-  await page.getByText(/upload from computer/i).first().click({ timeout: 30000, force: true })
-  const fc = await fcP
-  await fc.setFiles(paths.map((p) => path.resolve(p)))
-  await waitForAttachments(page, paths.map((p) => path.basename(p)), 45000)
+  const names = paths.map((p) => path.basename(p))
+  let lastErr = null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const fcP = page.waitForEvent('filechooser', { timeout: 12000 })
+    fcP.catch(() => {})
+    try {
+      await page.locator('[data-testid="composer-plus-btn"]').click({ timeout: 30000, force: true })
+      await sleep(jitter(600, 1200))
+      // The popover sometimes fails to open or renders without the upload
+      // option; a failed attempt is retried with a fresh plus-click.
+      await page.getByText(/upload from computer/i).first().click({ timeout: 15000, force: true })
+      const fc = await fcP
+      await fc.setFiles(paths.map((p) => path.resolve(p)))
+      await waitForAttachments(page, names, 45000)
+      return
+    } catch (e) {
+      lastErr = e
+      await fcP.catch(() => {})
+    }
+    await sleep(jitter(1500, 3000))
+  }
+  throw lastErr
+}
+
+// The submit button stays disabled while ChatGPT ingests an attached
+// document. That is a waitable condition, not a failure: poll until the
+// button is enabled so the fail-closed submission guard sees a submittable
+// composer instead of racing file processing.
+async function waitForSubmitEnabled(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const enabled = await page
+      .evaluate((sel) => {
+        const b = document.querySelector(sel)
+        return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true'
+      }, SUBMIT_SEL)
+      .catch(() => false)
+    if (enabled) return
+    await sleep(jitter(800, 1500))
+  }
+  throw new Error(`submit button still disabled after ${timeoutMs}ms (file still processing?)`)
 }
 
 // The reply is the first assistant message AFTER the accepted user message,
@@ -648,7 +738,14 @@ async function waitForReply(page, acceptedUserId, boundUrl, onPartial) {
     if (text !== null && text === lastText && text.trim()) {
       stable++
       const busy = await page.locator(STOP_SEL).count().catch(() => 0)
-      if (stable >= 2 && !busy) return text.trim()
+      if (stable >= 2 && !busy) {
+        // DOM stability says the turn ended; the API holds the authored
+        // markdown (DOM innerText strips emphasis and table pipes).
+        const exact = await fetchConversationMessages(page, convIdOf(boundUrl || page.url()))
+        const mine = exact && exact.msgs ? exact.msgs.find((m) => m.role === 'assistant' && m.id === replyId) : null
+        if (mine && mine.text.trim() && mine.text.trim().length + 50 >= text.trim().length) return mine.text.trim()
+        return text.trim()
+      }
     } else {
       stable = 0
       if (text !== null && text !== lastText && onPartial && text.trim()) await onPartial(text.trim())
@@ -659,8 +756,84 @@ async function waitForReply(page, acceptedUserId, boundUrl, onPartial) {
   throw new Error('response never finished streaming (raise CHATGPT_WEB_TIMEOUT)')
 }
 
-function notify(title, body) {
-  if (process.env.CHATGPT_WEB_NOTIFY === '0') return
+// runResume retries a failed assistant turn in standard ChatGPT: it clicks
+// the conversation's own Retry control (regenerate-thread-error-button) and
+// waits for the regenerated reply. It never clicks "Use Work".
+export async function runResume(jobId, turnId) {
+  const job = await turns.claim(jobId, turnId, process.pid)
+  if (!job) {
+    console.error(`turn ${turnId} of job ${jobId} is not admissible (stale, duplicate or terminal) — worker exiting`)
+    return
+  }
+  const tid = job.turnId
+  const fail = async (msg) => {
+    await turns.update(jobId, tid, (j) => {
+      j.status = 'error'
+      j.error = msg
+    })
+    notify('chatgpt-web: error', msg)
+  }
+  try {
+    await ensureBrowser()
+    await withPage(async (page) => {
+      await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      await sleep(jitter(4000, 7000))
+      const gate = await workGateState(page)
+      if (gate.work) {
+        throw new Error(
+          'conversation is gated by the ChatGPT Work prompt — the backend insists on Work mode for this thread and standard-mode retry is inert; start a new chat (Work is never auto-clicked)'
+        )
+      }
+      const retry = page.locator('[data-testid="regenerate-thread-error-button"]').first()
+      if ((await retry.count().catch(() => 0)) === 0) {
+        throw new Error('no thread error to retry — the conversation is not in a retryable state')
+      }
+      await withLock('send', async () => {
+        const s = await updateState((st) => st)
+        const L = limits()
+        const since = Date.now() - (s.lastSendAt || s.lastTurnEnd || 0)
+        const gap = L.minGapMs + Math.random() * 8000
+        if (since < gap) await sleep(gap - since)
+        await retry.click({ force: true, timeout: 10000 })
+        await updateState((st) => {
+          st.lastSendAt = Date.now()
+        })
+      })
+      const got = await fetchConversationMessages(page, convIdOf(job.url))
+      const lastUser = got && got.msgs ? [...got.msgs].reverse().find((m) => m.role === 'user') : null
+      const known = lastUser
+        ? (job.history || []).some((h) => h.role === 'user' && normPrompt(h.text) === normPrompt(lastUser.text))
+        : false
+      if (!lastUser || !known) {
+        throw new Error("cannot resume: the conversation's last user message does not belong to this job")
+      }
+      await turns.update(jobId, tid, (j) => {
+        j.acceptedUserId = lastUser.id
+      })
+      let lastPartial = 0
+      const reply = await waitForReply(page, lastUser.id, job.url, async (partial) => {
+        if (Date.now() - lastPartial < 2000) return
+        lastPartial = Date.now()
+        await turns.update(jobId, tid, (j) => {
+          j.status = 'streaming'
+          j.reply = partial
+        })
+      })
+      await turns.update(jobId, tid, (j) => {
+        j.status = 'done'
+        j.reply = reply
+        j.error = null
+        j.history.push({ role: 'assistant', text: reply })
+      })
+      notify('chatgpt-web: done', 'resume completed')
+    })
+  } catch (e) {
+    await fail(String(e.message || e))
+    process.exitCode = 1
+  }
+}
+
+function notify(title, body) {  if (process.env.CHATGPT_WEB_NOTIFY === '0') return
   try {
     execSync(
       `osascript -e 'display notification "${String(body).replace(/["']/g, '').slice(0, 90)}" with title "${title}"'`,
@@ -727,6 +900,7 @@ export async function runTurn(jobId, turnId) {
         }
 
         await typePrompt(page, composer, job.prompt)
+        if (job.files && job.files.length) await waitForSubmitEnabled(page, 150000)
         priorUserIds = await sendPromptGuarded(page, { boundUrl: job.url, prompt: job.prompt })
         await updateState((st) => {
           st.lastSendAt = Date.now()
@@ -773,16 +947,10 @@ export async function runTurn(jobId, turnId) {
         await sleep(jitter(1500, 3000))
       }
       // Final verification: the accepted turn still says exactly this
-      // prompt.
-      const snap = await page
-        .locator(USER_SEL)
-        .last()
-        .evaluate((el, attr) => {
-          const container = el.closest('[' + attr + ']')
-          return { currentId: container ? container.getAttribute(attr) : null, text: el.innerText }
-        }, MESSAGE_ID_ATTR)
-        .catch(() => null)
-      if (!snap || snap.currentId !== acceptedUserId || normPrompt(snap.text) !== normPrompt(job.prompt)) {
+      // prompt (via the API; the DOM renders markdown, not authored text).
+      const fin = await fetchConversationMessages(page, convIdOf(boundUrl))
+      const lastUser = fin && fin.msgs ? [...fin.msgs].reverse().find((m) => m.role === 'user') : null
+      if (!lastUser || lastUser.id !== acceptedUserId || normPrompt(lastUser.text) !== normPrompt(job.prompt)) {
         throw new Error("final verification failed: the conversation's last user message is not this turn's prompt")
       }
 
@@ -1177,4 +1345,6 @@ export async function runStatus() {
 const [cmd, arg, turnId] = process.argv.slice(2)
 if (cmd === 'job') {
   await runTurn(arg, turnId)
+} else if (cmd === 'resume') {
+  await runResume(arg, turnId)
 }
