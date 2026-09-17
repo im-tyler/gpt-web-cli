@@ -991,7 +991,9 @@ export async function runLogin() {
   console.error('verified: logged in.')
 }
 
-export async function runChats() {
+export async function runChats(opts = {}) {
+  const deleteIds = opts.deleteIds || null
+  const deleteAll = !!opts.deleteAll
   await withPage(async (page) => {
     await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
     const state = await classifyPage(page)
@@ -1039,6 +1041,51 @@ export async function runChats() {
     }
     if (!outcome.items.length) {
       console.log('no chats found')
+      return
+    }
+    if (deleteIds || deleteAll) {
+      const known = new Set(outcome.items.map((it) => String(it.id || '')))
+      const wanted = deleteAll ? [...known] : deleteIds
+      const unknown = wanted.filter((id) => !known.has(id))
+      if (unknown.length) {
+        console.error('not in visible chat list (cap 200): ' + unknown.join(', '))
+        process.exitCode = 1
+      }
+      const targets = wanted.filter((id) => known.has(id))
+      if (!targets.length) return
+      // Soft-delete via the same endpoint the sidebar uses: is_visible=false
+      // moves the thread to Deleted chats (30-day recovery). The old
+      // `PATCH /backend-api/conversation?id=` form started returning 405
+      // (verified 2026-09-17); the path-parameter form is the current one.
+      const del = await page.evaluate(async (ids) => {
+        const session = await fetch('/api/auth/session', { credentials: 'include' }).then((r) => r.json())
+        const token = session && session.accessToken
+        if (!token) return { error: 'no session token' }
+        const headers = { Authorization: 'Bearer ' + token, Accept: 'application/json', 'Content-Type': 'application/json' }
+        const results = []
+        for (const id of ids) {
+          const r = await fetch('/backend-api/conversation/' + id, {
+            method: 'PATCH',
+            credentials: 'include',
+            headers,
+            body: JSON.stringify({ is_visible: false }),
+          })
+          results.push({ id, ok: r.ok, http: r.status })
+          await new Promise((res) => setTimeout(res, 400))
+        }
+        return { results }
+      }, targets)
+      if (del.error) {
+        console.error('delete failed: ' + del.error)
+        process.exitCode = 1
+        return
+      }
+      const ok = del.results.filter((r) => r.ok).length
+      for (const r of del.results) {
+        if (!r.ok) console.error('delete failed: ' + r.id + ' http ' + r.http)
+      }
+      console.log('deleted ' + ok + '/' + del.results.length + ' chats (recoverable 30 days in Settings > Deleted chats)')
+      if (ok < del.results.length) process.exitCode = 1
       return
     }
     const idW = 36

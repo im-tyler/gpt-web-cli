@@ -9,6 +9,15 @@
 - `resume <id>` -> retry a failed assistant turn in standard ChatGPT (clicks the thread's own Retry control). NEVER clicks "Use Work": when the Work interstitial gates a conversation, sends/resume fail fast with that explanation — recover by starting a new chat. The interstitial's Retry is inert underneath (verified 2026-09-12); the backend wedges the thread into Work mode.
 - `wait <id> [secs]` -> blocks, prints reply, exit 1 on error (default 600s); `--stream` prints as it grows
 - `list`, `status`, `chats` (account threads via `/backend-api/conversations`, not CLI jobs), `login`
+- `chats --delete <id>... | --all` -> soft-delete listed conversations via `PATCH /backend-api/conversation/{id}` `{is_visible:false}` (30-day recovery in Settings > Deleted chats). The old `PATCH /backend-api/conversation?id=` form returns 405 since ~2026-09 (verified 2026-09-17).
+
+## Agent-mode threads (browser-research prompts)
+
+Browse/research-heavy prompts (audits, "check github", file-producing tasks) route to ChatGPT agent mode: server-side `web.run`/`container.exec` tools, `async_status` numeric on the conversation (`3` running, `4` stopped; null observed mid-flight). Consequences learned live 2026-09-17:
+
+- `start`/`send` observation often fails ("prompt was not observed as a new user message") because the agent DOM differs — the send still lands; the chat is created and the task runs. Check `~/.chatgpt-web/jobs/<id>.json` for the `url`, then poll `/backend-api/conversation/{id}` (`async_status`, `update_time`, mapping node count) instead of `wait`.
+- Agent tasks can stop mid-research at their step budget (async 4, no deliverable, last message mid-thought). Recovery: `send <job-id> "You completed the research but never delivered the report. Please now write the complete ... to a single .md file."` — re-engages the same agent run.
+- Deliverables are `sandbox:/mnt/data/*.md` links. If a sidebar file card appears, `files`/`download` work; often it does not — then reconstruct from the conversation JSON: the agent writes files via heredocs, so `code`-type messages contain `cat > path <<'MARK'` chunks; extract payload per marker, concatenate in create_time order, run any assembler script locally (patch `/mnt/data` paths).
 - `files <chat-id>` / `download <chat-id> [n|all] [outdir]` -> conversation file artifacts
 
 ## Upload + streaming notes (v0.3)

@@ -41,6 +41,8 @@ function usage() {
   list                list jobs
   status              daemon, session, usage caps, running job
   chats               list ChatGPT conversations (id, async status, updated, title)
+  chats --delete <id>... | chats --delete --all
+                      soft-delete conversations (30-day recovery in Deleted chats)
   model [name]        list the account's models, or set one by name fragment
                       (manual only — the CLI never switches models on its own)
   files <chat-id>     list files created in a conversation
@@ -313,10 +315,14 @@ async function cmdLogin() {
   await runLogin()
 }
 
-async function cmdChats() {
+async function cmdChats(restArgs) {
   ensureDirs()
+  const wantsDelete = restArgs.includes('--delete')
+  const deleteAll = wantsDelete && restArgs.includes('--all')
+  const ids = restArgs.filter((x) => x !== '--delete' && x !== '--all')
+  if (wantsDelete && !deleteAll && !ids.length) err('chats --delete needs chat ids or --all')
   const { runChats } = await import('./runner.mjs')
-  await runChats()
+  await runChats({ deleteIds: wantsDelete && !deleteAll ? ids : null, deleteAll })
 }
 
 async function cmdRunner(fn, ...args) {
@@ -359,7 +365,7 @@ switch (cmd) {
     cmdList()
     break
   case 'chats':
-    await cmdChats()
+    await cmdChats(positional.slice(1))
     break
   case 'model':
     await cmdRunner('runModel', a)
