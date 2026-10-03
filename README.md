@@ -23,6 +23,10 @@ chatgpt-web model                         # list available models
 chatgpt-web model "5.2 thinking"          # switch (manual only, persists)
 chatgpt-web files <chat-id>               # list file artifacts from a chat
 chatgpt-web download <chat-id> [n|all]    # download them
+chatgpt-web dot                           # bind + status of the account's dot
+chatgpt-web dot "message"                 # send into the dot thread (no reply wait)
+chatgpt-web dot --poll                    # messages since last poll
+chatgpt-web dot --context 20              # last 20 dot messages
 chatgpt-web status                        # daemon, session, usage vs caps
 ```
 
@@ -34,4 +38,5 @@ chatgpt-web status                        # daemon, session, usage vs caps
 - Concurrent turns (up to `CHATGPT_WEB_MAX_TABS`, default 2) run in separate tabs. Every turn is bound to a conversation id: destination authorisation happens inside the send critical section (after pacing and uploads), a fresh turn forces a new chat when `chatgpt.com/` auto-resumes a recent conversation, the reply is tracked by message identity (not message counts), and a reply is only recorded after verifying the turn's prompt is the conversation's last user message — foreign replies are refused, never recorded.
 - Job admission, reaping and capacity are one store transaction: concurrent `start`/`send` cannot exceed the caps or double-claim a job, a dead runner is filed conditionally (a completed reply can never be overwritten by a stale error), and state accounting is serialised so counters cannot lose increments.
 - `download` never clobbers: artifacts get id-tagged, collision-suffixed names and pre-existing files or symlinks are refused, not overwritten.
+- `dot` talks to the account's always-on dot (ChatGPT messaging room, not a `/c/<id>` thread): sends are paced, capped turns into the existing thread with API-verified acceptance, replies are read by polling (`--poll` advances a watermark, `--context` never touches it). Dot conversations do not count against ChatGPT usage limits; Work/Codex tasks the dot starts do.
 - `node --test store.test.mjs` covers the store and download invariants.

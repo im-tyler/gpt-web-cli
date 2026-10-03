@@ -48,6 +48,13 @@ function usage() {
   files <chat-id>     list files created in a conversation
   download <chat-id> [n|all] [outdir]
                       save conversation files to disk (default: all, current dir)
+  dot                 bind + status of the account's dot thread
+  dot "message"       send one message into the dot thread (paced, capped turn;
+                      no reply wait — the dot answers on its own horizon)
+  dot --poll [--json] print messages since the last poll, advance watermark
+  dot --context [n] [--json]
+                      print the last n messages (default 20), watermark untouched
+  dot --reset         forget the stored dot thread (re-discovered on next use)
   login               open the chatgpt-web Chrome window and wait until you log in
 
 The Chrome window stays open in the background (minimize it) — it owns the
@@ -331,6 +338,59 @@ async function cmdRunner(fn, ...args) {
   await mod[fn](...args)
 }
 
+// cmdDot dispatches the dot subcommand. A message send is admitted exactly
+// like cmdSend (tab slot, daily cap, turn record — never the new-chat cap,
+// the thread already exists), while reads are free like `chats`.
+async function cmdDot(args, files) {
+  if (files.length) err('dot does not support --file')
+  let json = false
+  let poll = false
+  let reset = false
+  let context = null
+  const text = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a === '--json') json = true
+    else if (a === '--poll') poll = true
+    else if (a === '--reset') reset = true
+    else if (a === '--context') {
+      const n = args[i + 1]
+      if (n !== undefined && !n.startsWith('--')) {
+        context = parseCount('context count', n, { max: 500 })
+        i++
+      } else {
+        context = 20
+      }
+    } else text.push(a)
+  }
+  const modes = [poll, reset, context !== null, text.length > 0].filter(Boolean).length
+  if (modes > 1) err('dot: choose one of a message, --poll, --context [n], --reset')
+  if (text.length > 1) err('dot: pass the message as one quoted argument')
+  ensureDirs()
+  if (reset) return cmdRunner('runDotReset')
+  if (context !== null) return cmdRunner('runDotContext', context, json)
+  if (poll) return cmdRunner('runDotPoll', json)
+  if (text.length === 1) {
+    await reapStale()
+    let limErr = null
+    await withStoreLock(async () => {
+      const running = runningJobs()
+      if (running.length >= limits().maxTabs) {
+        limErr = `${running.length} turns already running (max ${limits().maxTabs}, CHATGPT_WEB_MAX_TABS) — wait: chatgpt-web wait ${running[0].id}`
+        return
+      }
+      limErr = await updateState((s) => {
+        const e = checkLimits(s, false)
+        if (!e) recordTurn(s, false)
+        return e
+      })
+    })
+    if (limErr) err(limErr)
+    return cmdRunner('runDotSend', text[0])
+  }
+  return cmdRunner('runDotStatus')
+}
+
 const raw = process.argv.slice(2)
 const fileArgs = []
 const rest = []
@@ -366,6 +426,9 @@ switch (cmd) {
     break
   case 'chats':
     await cmdChats(positional.slice(1))
+    break
+  case 'dot':
+    await cmdDot(positional.slice(1), fileArgs)
     break
   case 'model':
     await cmdRunner('runModel', a)

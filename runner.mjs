@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs'
 import path from 'node:path'
-import { execSync, execFileSync } from 'node:child_process'
+import { execSync, execFileSync, execFile } from 'node:child_process'
 import crypto from 'node:crypto'
 import { chromium } from 'playwright-core'
 import {
@@ -11,6 +11,8 @@ import {
   limits,
   withLock,
   updateState,
+  updateDot,
+  readDot,
   turns,
   readState,
   runningJobs,
@@ -122,6 +124,27 @@ function setDaemonVisible(show) {
       { stdio: 'ignore', timeout: 5000 }
     )
   } catch {}
+}
+
+// hidePidOnce re-asserts invisibility on a known pid without blocking the
+// automation loop: osascript via execFile, fire-and-forget. The blocking
+// setDaemonVisible is only for paths that must be sure (login unhides).
+function hidePidOnce(pid) {
+  if (process.platform !== 'darwin' || !pid) return
+  execFile(
+    'osascript',
+    [
+      '-e',
+      'tell application "System Events" to set visible of (first process whose unix id is ' + pid + ') to false',
+    ],
+    { timeout: 5000 },
+    () => {}
+  )
+}
+
+function startHideLoop(pid) {
+  hidePidOnce(pid)
+  return setInterval(() => hidePidOnce(pid), 1200)
 }
 
 async function hideDaemon() {
@@ -240,26 +263,35 @@ async function ensureBrowser() {
       // nothing can catch.
       const child = await spawnStarted(bin, args, { detached: true, stdio: 'ignore' })
       child.unref()
-      const deadline = Date.now() + 20000
-      while (Date.now() < deadline) {
-        const v = await cdpVersion()
-        if (v) {
-          // Record identity only once the launched child provably owns the
-          // listener; never adopt whatever happened to come up.
-          if (listenerPid(CDP_PORT) !== child.pid) {
-            throw new Error('another process took the debugging port during startup — retry')
+      // Real Chrome launches foregrounded and paints before the debugging
+      // port answers, so hidden mode re-asserts visibility on the spawned
+      // pid from the first moment — the launch flash stays a blink instead
+      // of stealing the operator's keyboard for the whole startup.
+      const hideTimer = wantHeadless() ? startHideLoop(child.pid) : null
+      try {
+        const deadline = Date.now() + 20000
+        while (Date.now() < deadline) {
+          const v = await cdpVersion()
+          if (v) {
+            // Record identity only once the launched child provably owns the
+            // listener; never adopt whatever happened to come up.
+            if (listenerPid(CDP_PORT) !== child.pid) {
+              throw new Error('another process took the debugging port during startup — retry')
+            }
+            writeDaemonIdentity({ pid: child.pid, websocketUrl: v.webSocketDebuggerUrl })
+            return
           }
-          writeDaemonIdentity({ pid: child.pid, websocketUrl: v.webSocketDebuggerUrl })
-          return
+          try {
+            process.kill(child.pid, 0)
+          } catch {
+            throw new Error('chatgpt-web Chrome exited immediately after starting')
+          }
+          await sleep(300)
         }
-        try {
-          process.kill(child.pid, 0)
-        } catch {
-          throw new Error('chatgpt-web Chrome exited immediately after starting')
-        }
-        await sleep(300)
+        throw new Error('chatgpt-web Chrome started but the debugging port never came up')
+      } finally {
+        if (hideTimer) clearInterval(hideTimer)
       }
-      throw new Error('chatgpt-web Chrome started but the debugging port never came up')
     },
     { staleMs: 60000, timeoutMs: 120000 }
   )
@@ -279,20 +311,32 @@ async function ensurePageTarget() {
   await fetch(CDP_URL + '/json/new?about:blank', { method: 'PUT', signal: AbortSignal.timeout(2000) }).catch(() => {})
 }
 
-async function withPage(fn) {
+// withPage owns a command's tab. In hidden mode it also re-asserts daemon
+// invisibility for the whole command: navigation can foreground the window
+// mid-command (the old single hide ran before page.goto and lost), which
+// stole focus and dropped the operator's keystrokes into Chrome. The loop
+// shrinks any steal to the next tick. Login opts out — its window must be
+// visible for the human.
+async function withPage(fn, { keepVisible = false } = {}) {
   const identity = await ensureBrowser()
   // Connect through the verified browser endpoint, not the mutable HTTP
   // port; the tab is created through this connection.
   const browser = await chromium.connectOverCDP(identity.websocketUrl, { noDefaults: true })
   let page = null
+  let hideTimer = null
   try {
     const context = browser.contexts()[0]
     if (!context) throw new Error('no default context over CDP')
+    if (wantHeadless() && !keepVisible) {
+      hideTimer = startHideLoop(identity.pid)
+    }
     page = await context.newPage()
     return await fn(page)
   } finally {
+    if (hideTimer) clearInterval(hideTimer)
     if (page) await page.close().catch(() => {})
     await browser.close().catch(() => {})
+    if (wantHeadless() && !keepVisible) await hideDaemon()
   }
 }
 
@@ -978,16 +1022,19 @@ export async function runLogin() {
   await ensureBrowser()
   setDaemonVisible(true)
   console.error('chatgpt-web Chrome is open — log in to ChatGPT in its window. Waiting up to 5 minutes...')
-  await withPage(async (page) => {
-    await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
-    const deadline = Date.now() + 300000
-    for (;;) {
-      const state = await classifyPage(page)
-      if (state === 'in') return true
-      if (Date.now() > deadline) throw new Error('timed out waiting for login (5 min)')
-      await sleep(1500)
-    }
-  })
+  await withPage(
+    async (page) => {
+      await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      const deadline = Date.now() + 300000
+      for (;;) {
+        const state = await classifyPage(page)
+        if (state === 'in') return true
+        if (Date.now() > deadline) throw new Error('timed out waiting for login (5 min)')
+        await sleep(1500)
+      }
+    },
+    { keepVisible: true }
+  )
   console.error('verified: logged in.')
 }
 
@@ -1366,6 +1413,323 @@ export async function runModel(want) {
   })
 }
 
+// ----- dots: always-on agent threads over chatgpt.com messaging rooms -----
+//
+// A dot conversation is NOT a /c/<id> thread: /backend-api/conversation
+// returns 404 and the thread never appears in /backend-api/conversations
+// (verified 2026-10-03). The dot surface is a messaging room — reads go
+// through /backend-api/messaging/rooms/<room>/messages (authored text in
+// content.text, authorship by account_user_id), and sends go through the
+// page composer like every other turn. The dot replies on its own horizon,
+// so there is no wait: poll replaces blocking.
+
+const DOTS_URL = 'https://chatgpt.com/dots'
+const DOT_SUBMIT_SEL = 'button[aria-label="Send" i]'
+const DOT_SELF_ROW_SEL = '.message-row.self'
+const DOT_ROOM_LIST_LIMIT = 20
+// The messaging endpoints 422 above their cap: rooms max 20, messages max 32
+// (both are the page's own request sizes; 422 observed on 50 and 100).
+const DOT_MSG_PAGE_LIMIT = 32
+
+function dotRouteId(url) {
+  const m = String(url || '').match(/\/dots\/([0-9a-fA-F-]{8,})/)
+  return m ? m[1] : null
+}
+
+// authedFetchInPage runs a GET against a backend-api path from the page's
+// origin so the session cookies and bearer token apply. Reads only.
+async function authedFetchInPage(page, urlPath) {
+  return page
+    .evaluate(async (u) => {
+      const s = await fetch('/api/auth/session', { credentials: 'include' }).then((r) => r.json())
+      const token = s && s.accessToken
+      if (!token) return { error: 'no session token' }
+      const r = await fetch(u, {
+        headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+        credentials: 'include',
+      })
+      let body = null
+      try {
+        body = await r.json()
+      } catch {}
+      return { status: r.status, body }
+    }, urlPath)
+    .catch((e) => ({ error: e.message }))
+}
+
+// discoverDotRoom binds the dot: the /dots route redirects to the primary
+// dot's thread (its slug ids the dot), and the rooms list names exactly one
+// DM room per dot. Ambiguity refuses — two dots cannot share one record.
+async function ensureDotRecord() {
+  const existing = readDot()
+  if (existing && existing.roomId && existing.dotId && existing.myId) return existing
+  return withPage(async (page) => {
+    await page.goto(DOTS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    let dotId = null
+    const deadline = Date.now() + 25000
+    while (Date.now() < deadline) {
+      dotId = dotRouteId(page.url())
+      if (dotId) break
+      await sleep(700)
+    }
+    if (!dotId) {
+      const state = await classifyPage(page, 8000)
+      if (state === 'out') throw new Error('not logged in — run: chatgpt-web login')
+      throw new Error('no dot thread found at /dots — this account has no dot, or the surface changed')
+    }
+    await waitForComposer(page)
+    const res = await authedFetchInPage(page, '/backend-api/messaging/rooms?limit=' + DOT_ROOM_LIST_LIMIT)
+    if (res.error) throw new Error('rooms fetch failed: ' + res.error)
+    if (res.status !== 200) throw new Error('rooms fetch http ' + res.status)
+    const rooms = (res.body && res.body.items) || []
+    const dms = rooms.filter((r) => r.type === 'DM' && r.app_source === 'chatgpt:messaging')
+    if (dms.length === 0) throw new Error('no dot messaging room on this account')
+    if (dms.length > 1) {
+      throw new Error(
+        `${dms.length} dot rooms found — this build tracks exactly one; rooms: ` +
+          dms.map((r) => `${r.id} (${r.name || 'unnamed'})`).join(', ')
+      )
+    }
+    const room = dms[0]
+    const mine = (room.members || []).find((m) => typeof m.account_user_id === 'string' && m.account_user_id.startsWith('user-'))
+    if (!mine) throw new Error('dot room has no human member — refusing to guess authorship')
+    const record = {
+      roomId: room.id,
+      roomName: room.name || 'Dot',
+      dotId,
+      url: DOTS_URL + '/' + dotId,
+      myId: mine.account_user_id,
+      discoveredAt: new Date().toISOString(),
+      lastSentAt: null,
+      lastSentText: null,
+      watermark: null,
+    }
+    await updateDot(() => record)
+    return record
+  })
+}
+
+// fetchDotMessages returns the room's messages oldest-first, each as
+// { id, at, iso, mine, text }. Authorship is the member id, not the role
+// field: the dot's own messages also carry role "user" (verified shape).
+async function fetchDotMessages(page, dot, limit = DOT_MSG_PAGE_LIMIT) {
+  const res = await authedFetchInPage(page, '/backend-api/messaging/rooms/' + dot.roomId + '/messages?limit=' + limit)
+  if (res.error) throw new Error('dot messages fetch failed: ' + res.error)
+  if (res.status !== 200) throw new Error('dot messages fetch http ' + res.status)
+  const items = (res.body && res.body.items) || []
+  const msgs = items.map((m) => ({
+    id: String(m.id || ''),
+    at: Date.parse(m.created_at || 0) || 0,
+    iso: String(m.created_at || ''),
+    mine: m.account_user_id === dot.myId,
+    text: String((m.content && m.content.text) || ''),
+  }))
+  msgs.sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : 1))
+  return msgs
+}
+
+function renderDotMessage(m) {
+  const d = new Date(m.at)
+  const pad = (n) => String(n).padStart(2, '0')
+  const stamp = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const who = m.mine ? 'you' : 'dot'
+  const body = m.text.trim() || '(non-text message)'
+  return `[${stamp}] ${who}: ${body}`
+}
+
+// messagesAfter applies the watermark by ID, with created_at only as a
+// coarse floor: the server returns created_at with varying sub-second
+// precision between fetches (observed live), so exact time equality cannot
+// decide membership. Anything whose id is already counted is old; anything
+// unseen but more than 2s before the watermark is an old backfill.
+function messagesAfter(msgs, watermark) {
+  if (!watermark) return msgs
+  return msgs.filter((m) => !watermark.ids.includes(m.id) && m.at >= watermark.t - 2000)
+}
+
+function watermarkAt(msgs) {
+  if (!msgs.length) return null
+  const last = msgs[msgs.length - 1]
+  return { t: last.at, ids: msgs.filter((m) => m.at === last.at).map((m) => m.id) }
+}
+
+// withDotReadPage runs reads against a chatgpt.com page for the session
+// origin. Everything happens inside the callback: withPage owns the tab and
+// closes it when the callback returns.
+async function withDotReadPage(fn) {
+  return withPage(async (page) => {
+    await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await waitForComposer(page)
+    return fn(page)
+  })
+}
+
+export async function runDotStatus() {
+  const dot = await ensureDotRecord()
+  await withDotReadPage(async (page) => {
+    const msgs = await fetchDotMessages(page, dot)
+    const fresh = messagesAfter(msgs, dot.watermark)
+    console.log(`dot room ${dot.roomId} (${dot.roomName})`)
+    console.log(`thread: ${dot.url}`)
+    console.log(`messages on record: ${msgs.length}, new since last poll: ${fresh.length}`)
+    if (dot.lastSentAt) {
+      console.log(`last sent: ${new Date(dot.lastSentAt).toISOString()} — ${String(dot.lastSentText || '').replace(/\s+/g, ' ').slice(0, 60)}`)
+    } else {
+      console.log('last sent: never (this record)')
+    }
+    if (msgs.length) console.log('latest: ' + renderDotMessage(msgs[msgs.length - 1]).slice(0, 120))
+    if (fresh.length) console.log('run: chatgpt-web dot --poll')
+  })
+}
+
+export async function runDotPoll(asJson) {
+  const dot = await ensureDotRecord()
+  await withDotReadPage(async (page) => {
+    const msgs = await fetchDotMessages(page, dot)
+    if (!dot.watermark) {
+      const wm = watermarkAt(msgs)
+      await updateDot((d) => ({ ...(d || dot), watermark: wm }))
+      console.log(`tracking ${msgs.length} messages (watermark set, nothing printed) — run: chatgpt-web dot --context 20 for history`)
+      return
+    }
+    const fresh = messagesAfter(msgs, dot.watermark)
+    if (asJson) {
+      console.log(JSON.stringify({ room: dot.roomId, url: dot.url, messages: fresh }, null, 2))
+    } else {
+      if (!fresh.length) console.log('no new messages')
+      for (const m of fresh) console.log(renderDotMessage(m))
+    }
+    const wm = watermarkAt(msgs)
+    if (wm) await updateDot((d) => ({ ...(d || dot), watermark: wm }))
+  })
+}
+
+export async function runDotContext(count, asJson) {
+  const dot = await ensureDotRecord()
+  await withDotReadPage(async (page) => {
+    const msgs = await fetchDotMessages(page, dot)
+    const slice = msgs.slice(-count)
+    if (asJson) {
+      console.log(JSON.stringify({ room: dot.roomId, url: dot.url, messages: slice }, null, 2))
+      return
+    }
+    if (!slice.length) {
+      console.log('no messages on record')
+      return
+    }
+    for (const m of slice) console.log(renderDotMessage(m))
+  })
+}
+
+export async function runDotReset() {
+  const had = await updateDot(() => null)
+  console.log(had ? `cleared dot record for room ${had.roomId}` : 'no dot record stored')
+}
+
+// sendDotPromptGuarded is the dot-side mirror of sendPromptGuarded: it
+// re-validates the /dots/<id> route, the composer contents, and the enabled
+// Send button in one evaluation, then clicks. The dot composer's submit is
+// button[aria-label="Send"], not #composer-submit-button (verified shape).
+async function sendDotPromptGuarded(page, { dotId, prompt }) {
+  const result = await page
+    .evaluate(
+      ({ wantDot, promptText, selectors }) => {
+        if (location.origin !== 'https://chatgpt.com') return { error: 'unexpected origin' }
+        const route = location.pathname.match(/^\/dots\/([0-9a-fA-F-]{8,})\/?$/)
+        if (!route || route[1] !== wantDot) return { error: 'not on the dot thread before submission' }
+        const composer = document.querySelector(selectors.composer)
+        if (!composer) return { error: 'composer disappeared before submission' }
+        const text = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
+        const flat = text.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
+        if (flat !== promptText) return { error: 'composer changed before submission' }
+        const button = Array.from(document.querySelectorAll(selectors.submit)).find(
+          (b) => !b.disabled && b.getAttribute('aria-disabled') !== 'true' && b.offsetParent !== null
+        )
+        if (!button) return { error: 'dot Send button is missing or disabled' }
+        button.click()
+        return { ok: true }
+      },
+      {
+        wantDot: dotId,
+        promptText: normPrompt(prompt),
+        selectors: { composer: COMPOSER_SEL, submit: DOT_SUBMIT_SEL },
+      }
+    )
+    .catch((e) => ({ error: e.message }))
+  if (!result?.ok) throw new Error('dot submission guard: ' + (result?.error || 'unknown result'))
+}
+
+export async function runDotSend(text) {
+  if (!text || !String(text).trim()) throw new Error('dot message is empty')
+  const prompt = String(text)
+  const dot = await ensureDotRecord()
+  await ensureBrowser()
+  await withPage(async (page) => {
+    await page.goto(dot.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await waitForComposer(page)
+
+    await withLock('send', async () => {
+      const s = await updateState((st) => st)
+      const L = limits()
+      const since = Date.now() - (s.lastSendAt || s.lastTurnEnd || 0)
+      const gap = L.minGapMs + Math.random() * 8000
+      if (since < gap) await sleep(gap - since)
+      await sleep(jitter(1500, 4000))
+
+      const composer = await waitForComposer(page)
+      if (dotRouteId(page.url()) !== dot.dotId) {
+        await page.goto(dot.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+        await sleep(jitter(1500, 3000))
+        if (dotRouteId(page.url()) !== dot.dotId) throw new Error('tab is not on the dot thread — refusing to send')
+      }
+      const priorSelfRows = await page.locator(DOT_SELF_ROW_SEL).count().catch(() => 0)
+      const prior = await fetchDotMessages(page, dot, 20)
+      const priorMineIds = prior.filter((m) => m.mine).map((m) => m.id)
+
+      await typePrompt(page, composer, prompt)
+      await sendDotPromptGuarded(page, { dotId: dot.dotId, prompt })
+      await updateState((st) => {
+        st.lastSendAt = Date.now()
+      })
+
+      // Acceptance: a NEW message authored by me whose authored text matches,
+      // API-first; the DOM self-row count is the fallback if the endpoint
+      // hiccups. The dot surface has no /c/<id> accepted-prompt endpoint.
+      const deadline = Date.now() + 60000
+      let accepted = null
+      while (Date.now() < deadline && !accepted) {
+        try {
+          const now = await fetchDotMessages(page, dot, 20)
+          accepted =
+            now.find((m) => m.mine && !priorMineIds.includes(m.id) && normPrompt(m.text) === normPrompt(prompt)) || null
+        } catch {}
+        if (!accepted) {
+          const rows = await page.locator(DOT_SELF_ROW_SEL).count().catch(() => 0)
+          if (rows > priorSelfRows) {
+            accepted = { id: 'dom-self-row', at: Date.now(), iso: new Date().toISOString(), mine: true, text: prompt }
+          }
+        }
+        if (!accepted) await sleep(jitter(1500, 2500))
+      }
+      if (!accepted) throw new Error('the dot message was not observed as sent — check the thread manually')
+
+      // The watermark moves to the sent message, not the room tip: a fast
+      // dot reply must survive for the next poll.
+      const wm = { t: accepted.at, ids: [accepted.id] }
+      await updateDot((d) => ({
+        ...(d || dot),
+        watermark: wm,
+        lastSentAt: Date.now(),
+        lastSentText: prompt,
+      }))
+      console.log(`sent to dot room ${dot.roomId}`)
+      console.log(`thread: ${dot.url}`)
+      console.log(`message: ${String(prompt).replace(/\s+/g, ' ').slice(0, 80)}`)
+      console.log('replies land on their own schedule — read them: chatgpt-web dot --poll')
+    })
+  })
+}
+
 export async function runStatus() {
   const up = !!(await cdpVersion())
   const mode = !up ? '' : chromeIsHeadlessBin() ? ', headless' : wantHeadless() ? ', hidden' : ', windowed'
@@ -1380,6 +1744,12 @@ export async function runStatus() {
       `max ${L.maxTabs} concurrent`
   )
   console.log('running jobs:', rs.length ? rs.map((j) => j.id + ' — ' + (j.prompt || '').slice(0, 40)).join(' | ') : 'none')
+  const dot = readDot()
+  if (dot) {
+    console.log(
+      `dot: room ${dot.roomId} (${dot.roomName}), last sent ${dot.lastSentAt ? new Date(dot.lastSentAt).toISOString().slice(0, 16).replace('T', ' ') : 'never'}`
+    )
+  }
   if (up) {
     await withPage(async (page) => {
       await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })

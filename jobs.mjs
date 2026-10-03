@@ -216,6 +216,37 @@ export function readState() {
   }
 }
 
+// The dot thread record: which messaging room is the dot, who am I in it,
+// and how far reading has progressed. One file, written only under the
+// 'dot' lock (updateDot), same atomic-rename discipline as state.json.
+export const DOT_FILE = path.join(HOME, 'dot.json')
+
+export function readDot() {
+  try {
+    return JSON.parse(fs.readFileSync(DOT_FILE, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+// updateDot is the only way dot.json changes; the mutator runs inside the
+// dot lock against freshly read state. Returning null deletes the record.
+export async function updateDot(mutator) {
+  return withLock('dot', () => {
+    const cur = readDot()
+    const out = mutator(cur)
+    if (out === null) {
+      try {
+        fs.unlinkSync(DOT_FILE)
+      } catch {}
+      return null
+    }
+    const next = out || cur
+    if (next) atomicWriteJSON(DOT_FILE, next)
+    return next
+  })
+}
+
 // updateState is the only way state.json changes; the mutator runs inside
 // the state lock against freshly read state.
 export async function updateState(mutator) {
