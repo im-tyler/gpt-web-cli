@@ -69,6 +69,13 @@ function normText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim()
 }
 
+// Agent-mode storage autolinks bare URLs ("audit https://x" becomes
+// "audit [https://x](https://x)"). Strip self-labeled links before any
+// prompt-identity comparison against stored message text.
+function normStoredPrompt(s) {
+  return normText(String(s || '').replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, a, b) => (a === b ? a : m)))
+}
+
 // Only line endings are normalized for prompt comparison: broad whitespace
 // collapsing can alter code prompts.
 const normPrompt = (s) =>
@@ -510,8 +517,12 @@ async function sendPromptGuarded(page, { boundUrl, prompt }) {
         const composer = document.querySelector(selectors.composer)
         if (!composer) return { error: 'composer disappeared before submission' }
         const text = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
-        const flat = text.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
-        if (flat !== promptText) return { error: 'composer changed before submission' }
+        // Whitespace-flattened compare: the 2026-10 contenteditable can
+        // render a paragraph break inside the typed prompt (observed at the
+        // first token boundary); authored identity is verified via the API
+        // after send, so a rendered break is not a divergence.
+        const flat = text.replace(/\s+/g, ' ').trim()
+        if (flat !== promptText) return { error: 'composer changed before submission', saw: flat.slice(0, 90) }
         const button = document.querySelector(selectors.submit)
         if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') {
           return { error: 'send button is disabled' }
@@ -530,7 +541,10 @@ async function sendPromptGuarded(page, { boundUrl, prompt }) {
       }
     )
     .catch((e) => ({ error: e.message }))
-  if (!result?.ok) throw new Error('submission guard: ' + (result?.error || 'unknown result'))
+  if (!result?.ok) {
+    const detail = result?.saw ? ` (composer held: ${JSON.stringify(result.saw)})` : ''
+    throw new Error('submission guard: ' + (result?.error || 'unknown result') + detail)
+  }
   return result.priorIds
 }
 
@@ -587,7 +601,7 @@ async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineM
       const hit = [...got.msgs]
         .reverse()
         .find(
-          (m) => m.role === 'user' && normPrompt(m.text) === normPrompt(prompt) && !(priorIds || []).includes(m.id)
+          (m) => m.role === 'user' && normStoredPrompt(m.text) === normPrompt(prompt) && !(priorIds || []).includes(m.id)
         )
       if (hit) return hit.id
     }
@@ -889,9 +903,25 @@ export async function runTurn(jobId, turnId) {
           throw new Error('the tab left the fresh chat during preparation — refusing to type into ' + page.url())
         }
 
-        await typePrompt(page, composer, job.prompt)
-        if (job.files && job.files.length) await waitForSubmitEnabled(page, 150000)
-        priorUserIds = await sendPromptGuarded(page, { boundUrl: job.url, prompt: job.prompt })
+        // The 2026-10 UI syncs a server-side draft into the composer that
+        // can land AFTER typing and clobber the prompt. Retry the type when
+        // the guard sees the composer diverge; any other guard failure is
+        // real and fails the turn.
+        let submitErr = null
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await typePrompt(page, composer, job.prompt)
+          await sleep(attempt === 0 ? 900 : jitter(1400, 2600))
+          if (job.files && job.files.length) await waitForSubmitEnabled(page, 150000)
+          try {
+            priorUserIds = await sendPromptGuarded(page, { boundUrl: job.url, prompt: job.prompt })
+            submitErr = null
+            break
+          } catch (e) {
+            submitErr = e
+            if (!/composer changed/.test(String(e.message))) throw e
+          }
+        }
+        if (submitErr) throw submitErr
         await updateState((st) => {
           st.lastSendAt = Date.now()
         })
@@ -940,7 +970,7 @@ export async function runTurn(jobId, turnId) {
       // prompt (via the API; the DOM renders markdown, not authored text).
       const fin = await fetchConversationMessages(page, convIdOf(boundUrl))
       const lastUser = fin && fin.msgs ? [...fin.msgs].reverse().find((m) => m.role === 'user') : null
-      if (!lastUser || lastUser.id !== acceptedUserId || normPrompt(lastUser.text) !== normPrompt(job.prompt)) {
+      if (!lastUser || lastUser.id !== acceptedUserId || normStoredPrompt(lastUser.text) !== normPrompt(job.prompt)) {
         throw new Error("final verification failed: the conversation's last user message is not this turn's prompt")
       }
 
