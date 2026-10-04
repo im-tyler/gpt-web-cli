@@ -56,7 +56,7 @@ const USER_SEL = '[data-message-author-role="user"]'
 const MESSAGE_SEL = '[data-message-author-role]'
 const MESSAGE_ID_ATTR = 'data-message-id'
 const STOP_SEL = '[data-testid="stop-button"], button[aria-label*="stop" i]'
-const SUBMIT_SEL = '#composer-submit-button, [data-testid="send-button"]'
+const SUBMIT_SEL = '#composer-submit-button, [data-testid="send-button"], button[aria-label="Send"]'
 const LOGIN_SEL = '[data-testid="login-button"], button:has-text("Log in")'
 const NEW_CHAT_SEL = 'nav a[href="/"], [data-testid*="new-chat"] a, a:has-text("New chat")'
 
@@ -561,7 +561,7 @@ async function fetchConversationMessages(page, cid) {
           .filter(Boolean)
         const text = parts.join('\n')
         if (!text.trim()) continue
-        out.push({ id: m.id || k, role, create: m.create_time || 0, text })
+        out.push({ id: m.id || k, role, create: m.create_time || 0, text, status: m.status || null })
       }
       out.sort((a, b) => a.create - b.create)
       return { msgs: out }
@@ -580,9 +580,15 @@ async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineM
     }
     const got = await fetchConversationMessages(page, cid)
     if (got && got.msgs) {
-      const hit = got.msgs.find(
-        (m) => m.role === 'user' && normPrompt(m.text) === normPrompt(prompt) && !(priorIds || []).includes(m.id)
-      )
+      // Newest match wins: on the 2026-10 UI the DOM priorIds snapshot is
+      // always empty (no data-message-id nodes), so an oldest-first scan
+      // would re-accept an earlier identical prompt (the agent-mode
+      // "deliver the report" recovery sends repeat verbatim).
+      const hit = [...got.msgs]
+        .reverse()
+        .find(
+          (m) => m.role === 'user' && normPrompt(m.text) === normPrompt(prompt) && !(priorIds || []).includes(m.id)
+        )
       if (hit) return hit.id
     }
     await sleep(jitter(1500, 2500))
@@ -689,115 +695,55 @@ async function waitForSubmitEnabled(page, timeoutMs) {
   throw new Error(`submit button still disabled after ${timeoutMs}ms (file still processing?)`)
 }
 
-// The reply is the first assistant message AFTER the accepted user message,
-// in document order — not merely "one that didn't exist before the send",
-// which a late-mounting previous answer could satisfy.
-async function replyAfterUser(page, acceptedUserId) {
-  return page
-    .evaluate(
-      ([aSel, uSel, attr, userId]) => {
-        const users = Array.from(document.querySelectorAll('[' + attr + '="' + userId + '"] ' + uSel + ', ' + uSel))
-        const accepted = document.querySelector(`[${attr}="${userId}"]`)
-        if (!accepted) return null
-        const assistants = Array.from(document.querySelectorAll(aSel))
-        for (const a of assistants) {
-          const container = a.closest('[' + attr + ']')
-          if (container && accepted.compareDocumentPosition(container) & Node.DOCUMENT_POSITION_FOLLOWING) {
-            return { id: container.getAttribute(attr), text: a.innerText }
-          }
-        }
-        return null
-      },
-      [ASSISTANT_SEL, USER_SEL, MESSAGE_ID_ATTR, acceptedUserId]
-    )
-    .catch(() => null)
-}
-
+// The 2026-10 web UI renders transcripts without data-message-author-role
+// or data-message-id, so the old DOM reply tracker is dead. The conversation
+// API is the source of truth: poll it for the first assistant message after
+// the accepted user message, surface growing text as partials, and finish
+// when the backend marks the message finished (with a quiet-period fallback
+// for messages that never expose a terminal status).
 async function waitForReply(page, acceptedUserId, boundUrl, onPartial) {
   const boundId = convIdOf(boundUrl)
-  const onBound = async () => convIdOf(page.url()) === boundId
-  const rebind = async () => {
-    await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
-    await sleep(jitter(1500, 3000))
-  }
+  if (!boundId) throw new Error('no bound conversation url for reply wait')
   const started = Date.now()
-
-  let replyId = null
-  let streak = 0
-  while (Date.now() - started < TURN_TIMEOUT_MS) {
-    if (!(await onBound().catch(() => false))) {
-      await rebind()
-      streak = 0
-      await sleep(jitter(600, 1200))
-      continue
+  const rebindIfDrifted = async () => {
+    if (convIdOf(page.url()) !== boundId) {
+      await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
+      await sleep(jitter(1500, 3000))
     }
-    const found = await replyAfterUser(page, acceptedUserId)
-    if (found && found.id) {
-      streak++
-      if (streak >= 2) {
-        replyId = found.id
-        break
-      }
-    } else {
-      streak = 0
-    }
-    await sleep(jitter(600, 1200))
-  }
-  if (!replyId) {
-    throw new Error(`no response started within ${Math.round(TURN_TIMEOUT_MS / 1000)}s`)
   }
 
-  const textOf = () =>
-    page
-      .evaluate(
-        ([attr, id]) => {
-          const el = document.querySelector(`[${attr}="${id}"]`)
-          return el ? el.innerText : null
-        },
-        [MESSAGE_ID_ATTR, replyId]
-      )
-      .catch(() => null)
-
-  let lastText = ''
+  let lastPartial = ''
   let stable = 0
+  let firstSeen = 0
   while (Date.now() - started < TURN_TIMEOUT_MS) {
-    if (!(await onBound().catch(() => false))) {
-      await rebind()
-      continue
-    }
-    let text = await textOf()
-    if (text === null) {
-      // The tracked message id vanished: the streaming skeleton carries an
-      // id that is replaced when the real message mounts. Re-acquire by
-      // document position instead of stalling on the dead id forever.
-      const found = await replyAfterUser(page, acceptedUserId)
-      if (found && found.id && found.id !== replyId) {
-        replyId = found.id
-        lastText = ''
-        stable = 0
-        continue
+    await rebindIfDrifted()
+    const got = await fetchConversationMessages(page, boundId)
+    if (got && got.msgs) {
+      const accIdx = got.msgs.findIndex((m) => m.id === acceptedUserId)
+      if (accIdx >= 0) {
+        const reply = got.msgs.slice(accIdx + 1).find((m) => m.role === 'assistant')
+        if (reply && reply.text.trim()) {
+          if (!firstSeen) firstSeen = Date.now()
+          const text = reply.text.trim()
+          if (onPartial && text !== lastPartial) {
+            lastPartial = text
+            await onPartial(text)
+          }
+          if (reply.status === 'finished_successfully') return text
+          if (!reply.status) {
+            stable = text === lastPartial ? stable + 1 : 0
+            if (stable >= 4 && Date.now() - firstSeen > 20000) return text
+          } else {
+            stable = 0
+          }
+        }
       }
-      text = null
     }
-    if (text !== null && text === lastText && text.trim()) {
-      stable++
-      const busy = await page.locator(STOP_SEL).count().catch(() => 0)
-      if (stable >= 2 && !busy) {
-        // DOM stability says the turn ended; the API holds the authored
-        // markdown (DOM innerText strips emphasis and table pipes).
-        const exact = await fetchConversationMessages(page, convIdOf(boundUrl || page.url()))
-        const mine = exact && exact.msgs ? exact.msgs.find((m) => m.role === 'assistant' && m.id === replyId) : null
-        if (mine && mine.text.trim() && mine.text.trim().length + 50 >= text.trim().length) return mine.text.trim()
-        return text.trim()
-      }
-    } else {
-      stable = 0
-      if (text !== null && text !== lastText && onPartial && text.trim()) await onPartial(text.trim())
-      lastText = text ?? ''
-    }
-    await sleep(jitter(700, 1300))
+    await sleep(jitter(800, 1500))
   }
-  throw new Error('response never finished streaming (raise CHATGPT_WEB_TIMEOUT)')
+  throw new Error(
+    `response never finished within ${Math.round(TURN_TIMEOUT_MS / 1000)}s (raise CHATGPT_WEB_TIMEOUT)`
+  )
 }
 
 // runResume retries a failed assistant turn in standard ChatGPT: it clicks
