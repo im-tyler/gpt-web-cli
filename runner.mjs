@@ -1287,10 +1287,22 @@ async function openModelMenu(page, btn) {
   // Idempotent: toggling an already-open menu would close it, leaving the
   // retry with nothing to select.
   if ((await radios.count().catch(() => 0)) === 0) {
-    await btn.click({ force: true, timeout: 10000 })
+    // DOM click, not a playwright coordinate click: the radix trigger does
+    // not open reliably under forced pointer events in the hidden window.
+    await btn.evaluate((el) => el.click()).catch(() => {})
   }
   await radios.first().waitFor({ state: 'attached', timeout: 8000 }).catch(() => {})
-  const n = await radios.count().catch(() => 0)
+  let n = await radios.count().catch(() => 0)
+  if (n === 0) {
+    // 2026-10 picker: the menu can open in a "simple" effort view; the
+    // model list lives behind the in-menu view toggle.
+    const toggle = page.locator('[data-model-picker-view-toggle]')
+    if ((await toggle.count().catch(() => 0)) > 0) {
+      await toggle.first().evaluate((el) => el.click()).catch(() => {})
+      await radios.first().waitFor({ state: 'attached', timeout: 8000 }).catch(() => {})
+      n = await radios.count().catch(() => 0)
+    }
+  }
   if (n === 0) return null
   const labels = []
   for (let i = 0; i < n; i++) {
@@ -1298,7 +1310,10 @@ async function openModelMenu(page, btn) {
     labels.push(t)
   }
   const checked = await radios
-    .evaluateAll((els) => els.findIndex((e) => e.getAttribute('data-state') === 'checked'))
+    .evaluateAll(
+      (els) =>
+        els.findIndex((e) => e.getAttribute('data-state') === 'checked' || e.getAttribute('aria-checked') === 'true')
+    )
     .catch(() => -1)
   return { labels, checked, radios }
 }
@@ -1312,7 +1327,27 @@ async function applyModelSelection(page, btn, open, label) {
     if (!items) continue
     const idx = items.labels.findIndex((l) => l === label)
     if (idx < 0) continue
-    await items.radios.nth(idx).click({ force: true, timeout: 10000 })
+    // Full pointer sequence: 2026-10 menu items are radix-managed and a
+    // bare el.click() does not register; checked state is aria-checked.
+    await items.radios
+      .nth(idx)
+      .evaluate((el) => {
+        el.scrollIntoView({ block: 'center' })
+        const rect = el.getBoundingClientRect()
+        const cx = rect.left + rect.width / 2
+        const cy = rect.top + rect.height / 2
+        const opts = {
+          bubbles: true, cancelable: true, composed: true,
+          clientX: cx, clientY: cy, button: 0,
+          pointerId: 1, pointerType: 'mouse', isPrimary: true, view: window,
+        }
+        el.dispatchEvent(new PointerEvent('pointerover', opts))
+        el.dispatchEvent(new PointerEvent('pointerenter', opts))
+        el.dispatchEvent(new PointerEvent('pointerdown', opts))
+        el.dispatchEvent(new PointerEvent('pointerup', opts))
+        el.click()
+      })
+      .catch(() => {})
     await sleep(1500)
     const check = await openModelMenu(page, btn)
     if (check && check.labels[check.checked] === label) {
