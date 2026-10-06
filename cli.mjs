@@ -43,8 +43,11 @@ function usage() {
   chats               list ChatGPT conversations (id, async status, updated, title)
   chats --delete <id>... | chats --delete --all
                       soft-delete conversations (30-day recovery in Deleted chats)
-  model [name]        list the account's models, or set one by name fragment
-                      (manual only — the CLI never switches models on its own)
+  model [name]        list models + the power slider's stops (current marked),
+                       or set one by name fragment — a named model or a slider
+                       stop, e.g. "6 pro" (manual only; the CLI never switches
+                       models on its own. The slider is account-wide: sends
+                       inherit whatever it holds)
   files <chat-id>     list files created in a conversation
   download <chat-id> [n|all] [outdir]
                       save conversation files to disk (default: all, current dir)
@@ -431,7 +434,9 @@ switch (cmd) {
     await cmdDot(positional.slice(1), fileArgs)
     break
   case 'model':
-    await cmdRunner('runModel', a)
+    // Fragments are multi-word: "model 6 pro" must reach the matcher as
+    // "6 pro", not just "6".
+    await cmdRunner('runModel', positional.slice(1).join(' '))
     break
   case 'files':
     await cmdRunner('runFiles', a)

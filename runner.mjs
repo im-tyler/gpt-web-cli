@@ -60,6 +60,34 @@ const SUBMIT_SEL = '#composer-submit-button, [data-testid="send-button"], button
 const LOGIN_SEL = '[data-testid="login-button"], button:has-text("Log in")'
 const NEW_CHAT_SEL = 'nav a[href="/"], [data-testid*="new-chat"] a, a:has-text("New chat")'
 
+// A detached promise rejection (the 2026-09-09 filechooser-timeout crash
+// class) used to kill the worker with no job state, leaving "runner died"
+// as the only diagnosis. The net: the rejection is filed into the turn this
+// process owns and the process exits non-zero instead of crashing. Known
+// waitFor* sites carry their own inline catches; this catches the unknown
+// ones. Without an active turn (command paths) it only records the failure.
+let activeTurn = null
+
+export function registerActiveTurn(jobId, turnId) {
+  activeTurn = jobId && turnId ? { jobId, turnId } : null
+}
+
+process.on('unhandledRejection', (reason) => {
+  const msg = 'unhandled rejection: ' + (reason && reason.message ? reason.message : String(reason))
+  console.error(msg)
+  process.exitCode = 1
+  if (!activeTurn) return
+  const { jobId, turnId } = activeTurn
+  turns
+    .update(jobId, turnId, (j) => {
+      if (j.status !== 'error') {
+        j.status = 'error'
+        j.error = msg
+      }
+    })
+    .catch(() => {})
+})
+
 function convIdOf(url) {
   const m = String(url || '').match(/\/c\/([0-9a-fA-F-]{8,})/)
   return m ? m[1] : null
@@ -770,6 +798,7 @@ export async function runResume(jobId, turnId) {
     return
   }
   const tid = job.turnId
+  registerActiveTurn(jobId, tid)
   const fail = async (msg) => {
     await turns.update(jobId, tid, (j) => {
       j.status = 'error'
@@ -834,6 +863,8 @@ export async function runResume(jobId, turnId) {
   } catch (e) {
     await fail(String(e.message || e))
     process.exitCode = 1
+  } finally {
+    registerActiveTurn(null, null)
   }
 }
 
@@ -855,6 +886,7 @@ export async function runTurn(jobId, turnId) {
     return
   }
   const tid = job.turnId
+  registerActiveTurn(jobId, tid)
   const fail = async (msg) => {
     await turns.update(jobId, tid, (j) => {
       j.status = 'error'
@@ -991,6 +1023,7 @@ export async function runTurn(jobId, turnId) {
     await updateState((st) => {
       st.lastTurnEnd = Date.now()
     })
+    registerActiveTurn(null, null)
   }
 }
 
@@ -1274,8 +1307,10 @@ export async function runDownload(chatId, what, outdir) {
 }
 
 // The model picker: candidate selectors plus a composer-scoped positional
-// fallback, and a clear failure message when the UI moves.
+// fallback, and a clear failure message when the UI moves. The 2026-10
+// trigger has no testid; its stable hook is the aria-label.
 const MODEL_BTN_CANDIDATES = [
+  'button[aria-label="Select ChatGPT model"]',
   '[data-testid="model-switcher-dropdown-button"]',
   '#model-switcher-dropdown-button',
 ]
@@ -1302,14 +1337,232 @@ async function modelButton(page) {
   return page.locator('[data-cgw-model-btn="1"]').first()
 }
 
-export function pickModelMatch(labels, want) {
+// parseSliderDesc reads the Power slider's value out of its
+// aria-describedby text. The row exposes no aria-valuenow; the current stop
+// is only in the described text: "Pro, 5 of 5. Use Left and Right arrow
+// keys to adjust power".
+export function parseSliderDesc(text) {
+  const m = String(text || '').match(/^(.+?),\s*(\d+)\s+of\s+(\d+)\b/)
+  if (!m) return null
+  const n = Number(m[2])
+  const total = Number(m[3])
+  if (!n || !total || n > total) return null
+  return { name: normText(m[1]), n, total }
+}
+
+function describePick(p) {
+  return p.kind === 'model' ? p.label : p.label + ' (' + p.n + ' of ' + p.total + ')'
+}
+
+// pickPickerMatch resolves a user fragment against BOTH the named models
+// and the power-slider stops. A stop is matchable by its stop name or its
+// effective label ("pro" and "6 pro" both hit stop 5, one entry). Named
+// models keep the old substring semantics; ambiguity refuses.
+export function pickPickerMatch(modelLabels, stops, want) {
   const w = normText(want).toLowerCase()
-  const hits = labels.filter((l) => normText(l).toLowerCase().includes(w))
-  if (hits.length === 1) return { label: hits[0] }
-  if (hits.length > 1) {
-    return { error: `"${want}" matches ${hits.length} models: ${hits.join(' | ')} — be more specific` }
+  if (!w) return { error: 'empty model fragment' }
+  const cands = []
+  for (const label of modelLabels || []) {
+    const l = normText(label)
+    if (l) cands.push({ kind: 'model', label: l })
   }
-  return { error: `no model matches "${want}"` }
+  for (const s of stops || []) {
+    const name = normText(s.name)
+    if (!name) continue
+    cands.push({ kind: 'slider', label: name, alt: normText(s.effective || ''), effective: normText(s.effective || ''), n: s.n, total: s.total })
+  }
+  const hits = []
+  for (const c of cands) {
+    const hay = c.kind === 'slider' && c.alt && c.alt !== c.label ? c.label + ' ' + c.alt : c.label
+    if (hay.toLowerCase().includes(w)) hits.push(c)
+  }
+  // A stop matched through both its name and its effective label is one
+  // candidate, not two.
+  const uniq = hits.filter((h, i) => !hits.slice(0, i).some((p) => p.kind === h.kind && (h.kind === 'model' ? p.label === h.label : p.n === h.n)))
+  if (uniq.length === 1) return uniq[0]
+  if (uniq.length > 1) {
+    return { error: `"${want}" matches ${uniq.length} options: ${uniq.map(describePick).join(' | ')} — be more specific` }
+  }
+  return { error: `no model or power stop matches "${want}"` }
+}
+
+// openPickerMenu robustly opens the model popover. The radix trigger does
+// not react to every DOM click (observed live), so plain el.click() and the
+// full pointer sequence alternate across retries; an already-open menu is
+// left alone (toggling would close it).
+async function openPickerMenu(page, btn) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const open = await page
+      .evaluate(() => !!document.querySelector('[data-radix-popper-content-wrapper] [role="menu"], [role="menu"][data-state="open"]'))
+      .catch(() => false)
+    if (open) return true
+    await btn
+      .evaluate((el, mode) => {
+        if (mode === 'dom') {
+          el.click()
+          return
+        }
+        const r = el.getBoundingClientRect()
+        const o = {
+          bubbles: true, cancelable: true, composed: true,
+          clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0,
+          pointerId: 1, pointerType: 'mouse', isPrimary: true, view: window,
+        }
+        el.dispatchEvent(new PointerEvent('pointerover', o))
+        el.dispatchEvent(new PointerEvent('pointerdown', o))
+        el.dispatchEvent(new PointerEvent('pointerup', o))
+        el.click()
+      }, attempt % 2 === 0 ? 'dom' : 'pointer')
+      .catch(() => {})
+    await sleep(1500 + attempt * 400)
+    const nowOpen = await page
+      .evaluate(() => !!document.querySelector('[data-radix-popper-content-wrapper] [role="menu"], [role="menu"][data-state="open"]'))
+      .catch(() => false)
+    if (nowOpen) return true
+  }
+  return false
+}
+
+// readSliderState reads the power slider's live position from the open
+// menu: parsed stop ("Pro", 5 of 5) plus the "Select model" row's effective
+// label ("6 Pro"). Null when the row is absent.
+async function readSliderState(page) {
+  const raw = await page
+    .evaluate(() => {
+      const power =
+        document.querySelector('[data-reasoning-slider="true"]') ||
+        Array.from(document.querySelectorAll('[role="menuitem"]')).find((e) => e.getAttribute('aria-label') === 'Power')
+      if (!power) return null
+      const desc = (power.getAttribute('aria-describedby') || '').split(/\s+/)
+      const descText = desc
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((e) => (e.innerText || '').replace(/\s+/g, ' ').trim())
+        .join(' ')
+      const selModel = Array.from(document.querySelectorAll('[role="menuitem"]')).find((e) => e.getAttribute('aria-label') === 'Select model')
+      return { descText, effective: selModel ? (selModel.innerText || '').replace(/\s+/g, ' ').trim() : null }
+    })
+    .catch(() => null)
+  if (!raw) return null
+  const parsed = parseSliderDesc(raw.descText)
+  return parsed ? { ...parsed, effective: raw.effective } : null
+}
+
+// focusSlider is kept only as a belt-and-braces aid: synthetic key events
+// (stepSlider) drive the row without document focus, but a focused row
+// behaves identically to a human's arrows for the UI's own tracking.
+async function focusSlider(page) {
+  return page
+    .evaluate(() => {
+      const power =
+        document.querySelector('[data-reasoning-slider="true"]') ||
+        Array.from(document.querySelectorAll('[role="menuitem"]')).find((e) => e.getAttribute('aria-label') === 'Power')
+      if (!power) return false
+      power.focus()
+      return document.activeElement === power
+    })
+    .catch(() => false)
+}
+
+// stepSlider drives the slider with element-dispatched KeyboardEvents.
+// page.keyboard presses are at the mercy of radix's roving focus during the
+// popover's mount settle (observed: stretches of ignored CDP key events);
+// synthetic events on the row itself register regardless of focus, and the
+// read-back in the caller is the authority on whether a step landed.
+async function stepSlider(page, dir) {
+  const before = await readSliderState(page)
+  await page
+    .evaluate((key) => {
+      const p =
+        document.querySelector('[data-reasoning-slider="true"]') ||
+        Array.from(document.querySelectorAll('[role="menuitem"]')).find((e) => e.getAttribute('aria-label') === 'Power')
+      if (!p) return
+      for (const type of ['keydown', 'keyup']) {
+        p.dispatchEvent(new KeyboardEvent(type, { key, code: key, bubbles: true, cancelable: true, composed: true }))
+      }
+    }, dir)
+    .catch((e) => debugLog('synth press failed', String(e)))
+  await sleep(jitter(350, 650))
+  const after = await readSliderState(page)
+  debugLog('stepSlider', dir, before ? before.n : null, '->', after ? after.n : null)
+  if (after && before && after.n === before.n) await focusSlider(page)
+  return after
+}
+
+// settleSliderReads waits out the slider's animation lag: the described
+// position can keep drifting after the last key event landed, so a single
+// read is stale. Two consecutive reads agreeing is "settled".
+async function settleSliderReads(page, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  let last = null
+  let cur = null
+  while (Date.now() < deadline) {
+    cur = await readSliderState(page)
+    if (cur && last && cur.n === last.n) return cur
+    last = cur
+    await sleep(700)
+  }
+  return cur
+}
+
+// moveSliderTo presses toward targetN until a SETTLED read agrees. Any
+// read-based loop that skips the settle can both over-press and accept a
+// position the UI then drifts away from.
+async function moveSliderTo(page, targetN, total) {
+  let cur = await settleSliderReads(page)
+  for (let round = 0; round < 3 && cur && cur.n !== targetN; round++) {
+    let guard = 2 * total + 2
+    while (cur && cur.n !== targetN && guard-- > 0) {
+      cur = await stepSlider(page, cur.n < targetN ? 'ArrowRight' : 'ArrowLeft')
+    }
+    cur = await settleSliderReads(page)
+  }
+  return cur
+}
+
+// enumerateSliderStops walks the slider left to stop 1, right to its last
+// stop, and back to where it started, recording every stop's name and
+// effective label. The restore is settle-verified — a list command must not
+// leave the account default moved.
+async function enumerateSliderStops(page) {
+  const initial = await readSliderState(page)
+  if (!initial) throw new Error('power slider not present in the open model menu')
+  const total = initial.total
+  const stops = new Map()
+  const record = (s) => {
+    if (s) stops.set(s.n, { n: s.n, name: s.name, effective: s.effective, total: s.total })
+    return s
+  }
+  record(initial)
+  await focusSlider(page)
+  let cur = initial
+  let guard = 2 * total + 2
+  while (cur && cur.n > 1 && guard-- > 0) cur = record(await stepSlider(page, 'ArrowLeft'))
+  guard = 2 * total + 2
+  while (cur && cur.n < total && guard-- > 0) cur = record(await stepSlider(page, 'ArrowRight'))
+  const restored = await moveSliderTo(page, initial.n, total)
+  if (restored) record(restored)
+  if (!restored || restored.n !== initial.n) {
+    throw new Error(`power slider could not be restored to ${initial.n} of ${total} (at ${restored ? restored.n : '?'}) — check the picker manually`)
+  }
+  return { stops: [...stops.values()].sort((a, b) => a.n - b.n), final: restored }
+}
+
+// applySliderStop moves the slider to targetN with arrow presses and
+// verifies twice: settled in-menu, and again after closing and reopening
+// the popover (the read-back the owner can see).
+async function applySliderStop(page, btn, targetN, total) {
+  await focusSlider(page)
+  const cur = await moveSliderTo(page, targetN, total)
+  if (!cur || cur.n !== targetN) return null
+  const applied = cur
+  await page.keyboard.press('Escape').catch(() => {})
+  await sleep(jitter(900, 1500))
+  if (!(await openPickerMenu(page, btn))) return null
+  const recheck = await settleSliderReads(page, 4000)
+  await page.keyboard.press('Escape').catch(() => {})
+  if (!recheck || recheck.n !== targetN) return null
+  return recheck.effective ? recheck : applied
 }
 
 async function openModelMenu(page, btn) {
@@ -1317,9 +1570,14 @@ async function openModelMenu(page, btn) {
   // Idempotent: toggling an already-open menu would close it, leaving the
   // retry with nothing to select.
   if ((await radios.count().catch(() => 0)) === 0) {
-    // DOM click, not a playwright coordinate click: the radix trigger does
-    // not open reliably under forced pointer events in the hidden window.
-    await btn.evaluate((el) => el.click()).catch(() => {})
+    const anyMenuOpen = await page
+      .evaluate(() => !!document.querySelector('[data-radix-popper-content-wrapper] [role="menu"], [role="menu"][data-state="open"]'))
+      .catch(() => false)
+    if (!anyMenuOpen) {
+      // DOM click, not a playwright coordinate click: the radix trigger does
+      // not open reliably under forced pointer events in the hidden window.
+      await btn.evaluate((el) => el.click()).catch(() => {})
+    }
   }
   await radios.first().waitFor({ state: 'attached', timeout: 8000 }).catch(() => {})
   let n = await radios.count().catch(() => 0)
@@ -1388,6 +1646,11 @@ async function applyModelSelection(page, btn, open, label) {
   return false
 }
 
+// runModel lists or sets the account's chat model. The popover carries two
+// controls: the named-model radios and the thinking-power slider (the
+// "6 Pro" stop the UI exposes). The slider is an account-wide default —
+// once set here, every later composer (including runner-started fresh
+// chats) inherits it, so `start`/`send` need no model work of their own.
 export async function runModel(want) {
   await withPage(async (page) => {
     await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
@@ -1396,31 +1659,81 @@ export async function runModel(want) {
     if (!btn || (await btn.count().catch(() => 0)) === 0) {
       throw new Error('model picker not found — the web UI changed; update modelButton in runner.mjs')
     }
-    const menu = await openModelMenu(page, btn)
-    if (!menu || !menu.labels.filter(Boolean).length) {
-      await page.keyboard.press('Escape').catch(() => {})
-      throw new Error('model menu opened but listed no models — the web UI changed')
+    if (!(await openPickerMenu(page, btn))) {
+      throw new Error('model menu did not open — the web UI changed; update openPickerMenu in runner.mjs')
     }
-    if (!want) {
-      menu.labels.forEach((l, i) => console.log((i === menu.checked ? '* ' : '  ') + l))
+    // openModelMenu is idempotent (sees the open menu) and knows the radio
+    // view-toggle fallback from the 2026-10 simple view.
+    const menu = await openModelMenu(page, btn)
+    const modelLabels = menu ? menu.labels.filter(Boolean) : []
+    let slider = await readSliderState(page)
+    if (!modelLabels.length && !slider) {
       await page.keyboard.press('Escape').catch(() => {})
+      throw new Error('model menu opened but listed no models and no power slider — the web UI changed')
+    }
+
+    // Stop names exist only on the live control; enumeration walks the
+    // slider and restores the starting position (verified inside).
+    let stops = null
+    if (slider) {
+      const walk = await enumerateSliderStops(page)
+      stops = walk.stops
+      slider = walk.final
+    }
+
+    const closeMenu = () => page.keyboard.press('Escape').catch(() => {})
+    if (!want) {
+      modelLabels.forEach((l, i) => console.log((menu && i === menu.checked ? '* ' : '  ') + l))
+      if (stops) {
+        console.log('')
+        console.log('slider (thinking power):')
+        for (const s of stops) {
+          const mark = s.n === slider.n ? '* ' : '  '
+          const eff = s.effective && s.effective !== s.name ? `  (${s.effective})` : ''
+          console.log(`${mark}${s.n}  ${s.name}${eff}`)
+        }
+      }
+      await closeMenu()
       return
     }
-    const pick = pickModelMatch(menu.labels.filter(Boolean), want)
+
+    const pick = pickPickerMatch(modelLabels, stops || [], want)
     if (pick.error) {
       console.error(pick.error)
-      if (!pick.error.includes('matches ')) menu.labels.filter(Boolean).forEach((l) => console.error('  ' + l))
-      await page.keyboard.press('Escape').catch(() => {})
+      if (!pick.error.includes('matches ')) {
+        modelLabels.forEach((l) => console.error('  ' + l))
+        if (stops) {
+          console.error('  slider (thinking power):')
+          for (const s of stops) console.error(`  ${s.n}  ${s.name}${s.effective && s.effective !== s.name ? '  (' + s.effective + ')' : ''}`)
+        }
+      }
+      await closeMenu()
       process.exitCode = 1
       return
     }
-    const applied = await applyModelSelection(page, btn, menu, pick.label)
-    if (!applied) {
-      console.error(`could not confirm "${pick.label}" was selected — check the picker manually`)
+
+    if (pick.kind === 'model') {
+      const applied = await applyModelSelection(page, btn, menu, pick.label)
+      if (!applied) {
+        console.error(`could not confirm "${pick.label}" was selected — check the picker manually`)
+        process.exitCode = 1
+        return
+      }
+      console.log(`model set: ${pick.label}`)
+      return
+    }
+
+    // Slider stop: the enumeration left the menu open at the original
+    // position; applySliderStop moves, verifies, closes, reopens and
+    // re-verifies.
+    const result = await applySliderStop(page, btn, pick.n, pick.total)
+    if (!result) {
+      console.error(`could not confirm power stop "${pick.label}" (${pick.n} of ${pick.total}) — check the picker manually`)
       process.exitCode = 1
       return
     }
-    console.log(`model set: ${pick.label}`)
+    const eff = result.effective && result.effective !== pick.label ? ` — effective: ${result.effective}` : ''
+    console.log(`model set: ${pick.label} (${pick.n} of ${pick.total})${eff}`)
   })
 }
 
