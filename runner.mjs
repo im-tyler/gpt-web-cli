@@ -46,6 +46,10 @@ import {
   assertDotWindow,
   planDeletion,
   integerEnv,
+  retriablePollError,
+  pollDelayMs,
+  pollBackoffMs,
+  collectConversationListing,
 } from './audit-core.mjs'
 import {
   getBackendJSON,
@@ -53,6 +57,7 @@ import {
   validateUploads,
   writeJSONAtomic,
   boundedBrowserDownload,
+  evaluateBounded,
   ARTIFACT_MAX_BYTES,
 } from './audit-io.mjs'
 
@@ -545,8 +550,9 @@ async function assertBoundConversation(page, job) {
 // must be the UNIQUE visible match (querySelector/.first() could grab a
 // hidden template element). The fallback Enter press is gone; the DOM
 // priorIds collection is gone too — the acceptance baseline is the
-// conversation API, taken in the caller before this runs.
-async function sendPromptGuarded(page, { boundUrl, prompt, files = [] }) {
+// conversation API, taken in the caller before this runs. Unlike the
+// API-only wait phases, drift here is FATAL: this is the mutation boundary.
+export async function sendPromptGuarded(page, { boundUrl, prompt, files = [] }) {
   const bound = boundUrl ? conversationUrl(boundUrl) : null
   const route = bound ? conversationId(bound) : null
   const expected = [...(files || [])].map((f) => path.basename(f)).sort()
@@ -660,35 +666,65 @@ async function fetchConversationMessages(page, cid, timeoutMs = 15000) {
   return conversationSnapshot(response.data)
 }
 
+// rebindIfDrifted restores the bound conversation during the API-only wait
+// phases. The backend GET needs only the chatgpt.com ORIGIN (cookies +
+// bearer), but the daemon Chrome is a visible window the operator shares:
+// navigating this tab mid-wait used to fail the whole turn
+// (CONVERSATION_DRIFT) even though polling would have completed fine from
+// any chatgpt.com page. Re-binding is bounded — persistent drift stays
+// fatal. The MUTATION boundary (typing/clicking) keeps its strict route
+// guards in sendPromptGuarded/assertBoundConversation; only the read-only
+// phases re-bind.
+async function rebindIfDrifted(page, boundUrl, { attempts = 3 } = {}) {
+  let pageUrl = null
+  try {
+    pageUrl = conversationUrl(page.url())
+  } catch {
+    pageUrl = null
+  }
+  if (pageUrl === boundUrl) return
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null)
+    try {
+      if (conversationUrl(page.url()) === boundUrl) return
+    } catch {}
+    await sleep(jitter(800, 1500))
+  }
+  throw new AuditError(
+    'CONVERSATION_DRIFT',
+    'page left the bound conversation and re-binding failed (at ' + page.url() + ')'
+  )
+}
+
 // waitForAcceptedPrompt proves the submission landed: a NEW user message
 // (id outside the API baseline captured before the click) whose authored
-// text is exactly the prompt. Transient server errors retry; drift off the
-// bound conversation is fatal, not something to navigate back from.
-async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineMs) {
+// text is exactly the prompt. Transient poll errors (status 0, 408/429,
+// 5xx, 404) retry to the deadline with backoff — a poll is read-only and a
+// single hiccup must not kill an in-flight turn; auth-class errors stay
+// fatal. Operator navigation of the shared daemon tab is survived by
+// re-binding (rebindIfDrifted).
+export async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineMs) {
   const url = conversationUrl(boundUrl)
   const cid = conversationId(url)
   const baseline = priorIds instanceof Set ? priorIds : new Set(priorIds || [])
   const deadline = Date.now() + deadlineMs
   let lastError = null
+  let transient = 0
   while (Date.now() < deadline) {
-    let pageUrl = null
-    try {
-      pageUrl = conversationUrl(page.url())
-    } catch {
-      pageUrl = null
-    }
-    if (pageUrl !== url) {
-      throw new AuditError('CONVERSATION_DRIFT', 'page left the bound conversation (at ' + page.url() + ')')
-    }
+    await rebindIfDrifted(page, url)
     try {
       const snapshot = await fetchConversationMessages(page, cid, Math.min(15000, Math.max(1, deadline - Date.now())))
+      transient = 0
       const hit = findAcceptedUser(snapshot, { priorUserIds: baseline, prompt })
       if (hit) return hit.id
     } catch (e) {
-      if (![404, 500, 502, 503, 504].includes(e.httpStatus)) throw e
+      if (!retriablePollError(e.httpStatus)) throw e
       lastError = e
+      transient++
+      await sleep(Math.min(pollBackoffMs(transient, pollDelayMs('accept')), Math.max(0, deadline - Date.now())))
+      continue
     }
-    await sleep(Math.min(1500, Math.max(0, deadline - Date.now())))
+    await sleep(Math.min(pollDelayMs('accept'), Math.max(0, deadline - Date.now())))
   }
   throw new AuditError(
     'ACCEPTANCE_UNKNOWN',
@@ -702,26 +738,21 @@ async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineM
 // only on finished_successfully + end_turn (a "finished" intermediate
 // message without end_turn is not the answer; there is no text-silence
 // fallback). excludedAssistantIds keeps a retry from "completing" by
-// re-reading a pre-existing answer.
-async function waitForReply(page, acceptedUserId, boundUrl, onPartial, excludedAssistantIds = new Set()) {
+// re-reading a pre-existing answer. Transient poll errors retry to the
+// deadline with backoff; drift re-binds (both as in waitForAcceptedPrompt).
+export async function waitForReply(page, acceptedUserId, boundUrl, onPartial, excludedAssistantIds = new Set()) {
   const url = conversationUrl(boundUrl)
   const cid = conversationId(url)
   const deadline = Date.now() + validateRunnerConfig().turnTimeoutMs
   let previous = ''
   let lastError = null
+  let transient = 0
   while (Date.now() < deadline) {
     assertRunnerLive()
-    let pageUrl = null
-    try {
-      pageUrl = conversationUrl(page.url())
-    } catch {
-      pageUrl = null
-    }
-    if (pageUrl !== url) {
-      throw new AuditError('CONVERSATION_DRIFT', 'page left the bound conversation (at ' + page.url() + ')')
-    }
+    await rebindIfDrifted(page, url)
     try {
       const snapshot = await fetchConversationMessages(page, cid, Math.min(15000, Math.max(1, deadline - Date.now())))
+      transient = 0
       const result = inspectReply(snapshot, acceptedUserId)
       if (!excludedAssistantIds.has(result.messageId)) {
         if (result.text !== previous) {
@@ -731,10 +762,13 @@ async function waitForReply(page, acceptedUserId, boundUrl, onPartial, excludedA
         if (result.state === 'done') return result
       }
     } catch (e) {
-      if (![404, 500, 502, 503, 504].includes(e.httpStatus)) throw e
+      if (!retriablePollError(e.httpStatus)) throw e
       lastError = e
+      transient++
+      await sleep(Math.min(pollBackoffMs(transient, pollDelayMs('reply')), Math.max(0, deadline - Date.now())))
+      continue
     }
-    await sleep(Math.min(1200, Math.max(0, deadline - Date.now())))
+    await sleep(Math.min(pollDelayMs('reply'), Math.max(0, deadline - Date.now())))
   }
   throw new AuditError(
     'REPLY_TIMEOUT',
@@ -1209,34 +1243,41 @@ export async function runChats(opts = {}) {
       process.exitCode = 1
       return
     }
-    const result = await page.evaluate(async () => {
-      const session = await fetch('/api/auth/session', { credentials: 'include' }).then((r) => r.json())
-      const token = session && session.accessToken
-      if (!token) return { error: 'no session token', items: [] }
-      const items = []
-      let offset = 0
-      let lastError = null
-      let hitCap = false
-      const limit = 50
-      for (;;) {
-        const r = await fetch('/backend-api/conversations?offset=' + offset + '&limit=' + limit + '&order=updated', {
-          credentials: 'include',
-          headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
-        })
-        if (!r.ok) {
-          lastError = 'conversations http ' + r.status
-          break
-        }
-        const j = await r.json()
-        const batch = j.items || []
-        items.push(...batch)
-        if (batch.length < limit || items.length >= 200) {
-          hitCap = items.length >= 200
-          break
-        }
-        offset += limit
-      }
-      return { items, lastError, hitCap }
+    // The listing is driven page-by-page from the Node side: every in-page
+    // fetch is abort-bounded and every evaluate is wall-clock bounded (a
+    // wedged fetch must never suspend this command forever), while the
+    // pagination/completeness contract itself lives in audit-core's
+    // collectConversationListing.
+    const result = await collectConversationListing(async (offset) => {
+      const res = await evaluateBounded(
+        page,
+        async ({ path, timeoutMs }) => {
+          try {
+            const session = await (
+              await fetch('/api/auth/session', {
+                credentials: 'include',
+                signal: AbortSignal.timeout(timeoutMs),
+              })
+            ).json()
+            const token = session && session.accessToken
+            if (!token) return { error: 'no session token' }
+            const r = await fetch(path, {
+              credentials: 'include',
+              headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+              signal: AbortSignal.timeout(timeoutMs),
+            })
+            if (!r.ok) return { error: 'conversations http ' + r.status }
+            const j = await r.json()
+            return { items: Array.isArray(j && j.items) ? j.items : [] }
+          } catch (e) {
+            return { error: String((e && e.message) || e) }
+          }
+        },
+        { path: `/backend-api/conversations?offset=${offset}&limit=50&order=updated`, timeoutMs: 20000 },
+        30000,
+        'chats listing page'
+      )
+      return res && res.error ? { error: res.error } : { items: (res && res.items) || [] }
     })
     // Honesty before any empty-list shortcut: an error with zero rows is a
     // failure, not "no chats found".
@@ -1277,7 +1318,12 @@ export async function runChats(opts = {}) {
       console.log(`deleting ${plan.targets.length} conversation(s)…`)
       // Targets are frozen; the active-turn revalidation and the PATCHes
       // run under the same store lock admissions use, so no turn can be
-      // admitted against a conversation being deleted.
+      // admitted against a conversation being deleted. Every fetch inside
+      // the loop is abort-bounded and the whole evaluation is wall-clock
+      // bounded: one wedged PATCH must not hold the store flock (and thereby
+      // block every admission/worker update CLI-wide) for more than one
+      // transport timeout. A network-level failure stops the loop — hammering
+      // the remaining ids on a dead transport cannot succeed.
       let del = null
       await withStoreLock(async () => {
         const live = runningJobs().map((j) => convIdOf(j.url)).filter(Boolean)
@@ -1288,29 +1334,55 @@ export async function runChats(opts = {}) {
         // Soft-delete via the same endpoint the sidebar uses:
         // is_visible=false hides the thread from the sidebar. Recovery
         // terms are the service's to define — check its UI.
-        del = await page.evaluate(async (ids) => {
-          const session = await fetch('/api/auth/session', { credentials: 'include' }).then((r) => r.json())
-          const token = session && session.accessToken
-          if (!token) return { error: 'no session token' }
-          const headers = { Authorization: 'Bearer ' + token, Accept: 'application/json', 'Content-Type': 'application/json' }
-          const results = []
-          for (const id of ids) {
-            const r = await fetch('/backend-api/conversation/' + id, {
-              method: 'PATCH',
-              credentials: 'include',
-              headers,
-              body: JSON.stringify({ is_visible: false }),
-            })
-            results.push({ id, ok: r.ok, http: r.status })
-            await new Promise((res) => setTimeout(res, 400))
-          }
-          return { results }
-        }, plan.targets)
+        del = await evaluateBounded(
+          page,
+          async ({ ids, timeoutMs }) => {
+            try {
+              const session = await (
+                await fetch('/api/auth/session', {
+                  credentials: 'include',
+                  signal: AbortSignal.timeout(timeoutMs),
+                })
+              ).json()
+              const token = session && session.accessToken
+              if (!token) return { error: 'no session token' }
+              const headers = {
+                Authorization: 'Bearer ' + token,
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+              }
+              const results = []
+              for (const id of ids) {
+                try {
+                  const r = await fetch('/backend-api/conversation/' + id, {
+                    method: 'PATCH',
+                    credentials: 'include',
+                    headers,
+                    body: JSON.stringify({ is_visible: false }),
+                    signal: AbortSignal.timeout(timeoutMs),
+                  })
+                  results.push({ id, ok: r.ok, http: r.status })
+                } catch (e) {
+                  const reason = String((e && e.message) || e)
+                  results.push({ id, ok: false, http: 0, error: reason })
+                  return { results, error: 'network failure at ' + id + ': ' + reason }
+                }
+                await new Promise((res) => setTimeout(res, 400))
+              }
+              return { results }
+            } catch (e) {
+              return { error: String((e && e.message) || e) }
+            }
+          },
+          { ids: plan.targets, timeoutMs: 20000 },
+          Math.max(60000, plan.targets.length * 25000),
+          'chats delete'
+        )
       })
       if (del.error) {
         console.error('delete failed: ' + del.error)
         process.exitCode = 1
-        return
+        if (!del.results) return
       }
       const ok = del.results.filter((r) => r.ok).length
       for (const r of del.results) {
@@ -2038,24 +2110,42 @@ function dotRouteId(url) {
 }
 
 // authedFetchInPage runs a GET against a backend-api path from the page's
-// origin so the session cookies and bearer token apply. Reads only.
-async function authedFetchInPage(page, urlPath) {
-  return page
-    .evaluate(async (u) => {
-      const s = await fetch('/api/auth/session', { credentials: 'include' }).then((r) => r.json())
-      const token = s && s.accessToken
-      if (!token) return { error: 'no session token' }
-      const r = await fetch(u, {
-        headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
-        credentials: 'include',
-      })
-      let body = null
+// origin so the session cookies and bearer token apply. Reads only. Both
+// fetches are abort-bounded and the evaluate is wall-clock bounded: the dot
+// read commands are synchronous, and an unbounded hang used to leave the
+// CLI (and its dot-operation lock) wedged until the process was killed.
+async function authedFetchInPage(page, urlPath, timeoutMs = 15000) {
+  const result = await evaluateBounded(
+    page,
+    async ({ u, timeoutMs }) => {
       try {
-        body = await r.json()
-      } catch {}
-      return { status: r.status, body }
-    }, urlPath)
-    .catch((e) => ({ error: e.message }))
+        const s = await (
+          await fetch('/api/auth/session', {
+            credentials: 'include',
+            signal: AbortSignal.timeout(timeoutMs),
+          })
+        ).json()
+        const token = s && s.accessToken
+        if (!token) return { error: 'no session token' }
+        const r = await fetch(u, {
+          headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+          credentials: 'include',
+          signal: AbortSignal.timeout(timeoutMs),
+        })
+        let body = null
+        try {
+          body = await r.json()
+        } catch {}
+        return { status: r.status, body }
+      } catch (e) {
+        return { error: String((e && e.message) || e) }
+      }
+    },
+    { u: urlPath, timeoutMs },
+    timeoutMs + 5000,
+    'dot api fetch'
+  ).catch((e) => ({ error: e.message }))
+  return result
 }
 
 // discoverDotRoom binds the dot: the /dots route redirects to the primary
@@ -2365,12 +2455,25 @@ export async function runDotSend(text, reservation = null) {
         const prior = await fetchDotMessages(page, dot, 20)
         const priorMineIds = new Set(prior.filter((m) => m.mine).map((m) => m.id))
 
+        // The reservation's submission state brackets the click window so
+        // an interrupted foreground CLI (or any later failure) can be filed
+        // honestly: after 'dispatching' the message may already have
+        // landed, and the filed error must say so instead of inviting a
+        // blind duplicate retry.
+        const setSubmissionState = (state) =>
+          reservation
+            ? turns.update(reservation.jobId, reservation.turnId, (j) => {
+                j.submissionState = state
+              })
+            : Promise.resolve()
         if (reservation) assertOwnedBeforeMutation(reservation.jobId, reservation.turnId)
+        await setSubmissionState('dispatching')
         await typePrompt(page, composer, prompt)
         await sendDotPromptGuarded(page, { dotId: dot.dotId, prompt })
         await updateState((st) => {
           st.lastSendAt = Date.now()
         })
+        await setSubmissionState('dispatched')
 
         const deadline = Date.now() + 60000
         let accepted = null

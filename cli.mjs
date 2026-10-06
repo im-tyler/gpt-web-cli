@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -18,11 +19,12 @@ import {
   sleep,
   limits,
 } from './jobs.mjs'
-import { spawnRunnerLogged, positiveInteger } from './core-fixes.mjs'
-import { parseCli, conversationId, assertWaitGeneration } from './audit-core.mjs'
-import { writeOutput, validateUploads } from './audit-io.mjs'
+import { spawnRunnerLogged, positiveInteger, createSnapshotWriter } from './core-fixes.mjs'
+import { parseCli, conversationId, assertWaitGeneration, dotSendInterruption } from './audit-core.mjs'
+import { writeOutput, validateUploads, installInterruptionFence } from './audit-io.mjs'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 const RUNNER = path.join(__dirname, 'runner-entry.mjs')
 
 function usage() {
@@ -267,23 +269,20 @@ async function cmdWait(id, timeoutSec, stream, opts = {}) {
   const expectedTurnId = opts.turn || initial.turnId
   assertWaitGeneration(initial, expectedTurnId)
   const deadline = Date.now() + timeout
-  let previous = ''
   let nextReap = 0
+  // The printed stream is a sequence of revisions, not a guaranteed prefix
+  // of the final reply: a replacement is labelled and reprinted in full
+  // rather than spliced onto the old text. The revision contract lives in
+  // createSnapshotWriter — this is the same writer, not a divergent copy.
+  const writeSnapshot = createSnapshotWriter((bytes) => writeOutput(process.stdout, bytes))
   for (;;) {
     if (Date.now() >= nextReap) {
       await reapStale() // includes admitted-but-unclaimed startup failures
       nextReap = Date.now() + 1000
     }
     const j = assertWaitGeneration(readJob(id), expectedTurnId)
-    // The printed stream is a sequence of revisions, not a guaranteed
-    // prefix of the final reply: a replacement is labelled and reprinted
-    // in full rather than spliced onto the old text.
-    if (stream && typeof j.reply === 'string' && j.reply !== previous) {
-      const bytes = j.reply.startsWith(previous)
-        ? j.reply.slice(previous.length)
-        : '\n[reply revised; complete replacement follows]\n' + j.reply
-      await writeOutput(process.stdout, bytes)
-      previous = j.reply
+    if (stream && typeof j.reply === 'string') {
+      await writeSnapshot(j.reply)
     }
     if (j.status === 'done') {
       if (opts.json) {
@@ -356,7 +355,14 @@ async function cmdRunner(fn, ...args) {
 // generation (kind dot-send): its slot is visible to admission, a dead CLI
 // process is filed via the startup lease/reaper, and 'done' means sent —
 // never 'assistant replied'.
-async function cmdDotMessage(text) {
+//
+// The send runs in THIS process's foreground across a real click → API
+// verification window. Workers get fatal fencing from runner-entry; the
+// foreground gets it here: an interrupt (or fatal process error) inside the
+// window files the honest uncertain-send diagnosis — never the reaper's
+// "runner died (pid N)", which invites a blind retry that duplicates the
+// message. `deps.runDotSend` is an injection point for tests.
+export async function cmdDotMessage(text, deps = {}) {
   checkPrompt(text)
   ensureDirs()
   await reapStale()
@@ -389,20 +395,41 @@ async function cmdDotMessage(text) {
   if (limErr) throw new Error(limErr)
   const claimed = await turns.claim(admitted.id, admitted.turnId, process.pid)
   if (!claimed) throw new Error('dot-send reservation was superseded before launch')
-  const { runDotSend } = await import('./runner.mjs')
+  const { runDotSend: liveSend } = await import('./runner.mjs')
+  const send = deps.runDotSend || liveSend
+  const fence = installInterruptionFence({
+    file: async (detail) => {
+      const current = readJob(admitted.id)
+      await turns.update(admitted.id, admitted.turnId, (j) => {
+        j.status = 'error'
+        j.error = dotSendInterruption(current && current.submissionState, detail)
+      })
+    },
+  })
   try {
-    await runDotSend(text, { jobId: admitted.id, turnId: admitted.turnId })
+    await send(text, { jobId: admitted.id, turnId: admitted.turnId })
     await turns.update(admitted.id, admitted.turnId, (j) => {
       j.status = 'done'
       j.submissionState = 'sent'
       j.error = null
     })
   } catch (e) {
+    // Once dispatch passed, ANY failure is an uncertain-send: the filed
+    // error must advise inspection before retrying, never imply nothing
+    // was sent.
+    const current = readJob(admitted.id)
+    const dispatched = !!(current && ['dispatching', 'dispatched', 'accepted'].includes(current.submissionState))
+    let message = String(e.message || e)
+    if (dispatched && !/inspect/.test(message)) {
+      message += ' — the message may have been sent; inspect the dot thread before retrying'
+    }
     await turns.update(admitted.id, admitted.turnId, (j) => {
       j.status = 'error'
-      j.error = String(e.message || e)
+      j.error = message
     })
     throw e
+  } finally {
+    fence.close()
   }
   console.log(`dot-send job: ${admitted.id} (done = sent, not replied)`)
 }
@@ -460,9 +487,25 @@ async function main(argv) {
   }
 }
 
-try {
-  await main(process.argv.slice(2))
-} catch (e) {
-  console.error(String(e.message || e))
-  process.exitCode = 1
+// Run as the bin only when executed directly — tests import the command
+// functions (main must not fire on import). realpath on BOTH sides: the
+// installed bin reaches this file through a symlink chain
+// (~/.local/bin/chatgpt-web -> ... -> cli.mjs) that path.resolve would not
+// dereference.
+const invokedAsBin = (() => {
+  try {
+    if (!process.argv[1]) return false
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename)
+  } catch {
+    return false
+  }
+})()
+
+if (invokedAsBin) {
+  try {
+    await main(process.argv.slice(2))
+  } catch (e) {
+    console.error(String(e.message || e))
+    process.exitCode = 1
+  }
 }

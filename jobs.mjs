@@ -1,7 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import crypto from 'node:crypto'
 
 import { makeTurnStore } from './turn-store.mjs'
 import { jobId } from './core-fixes.mjs'
@@ -23,11 +22,6 @@ export function ensureDirs() {
     fs.chmodSync(dir, 0o700)
   }
 }
-
-export function newId() {
-  return Date.now().toString(36) + '-' + crypto.randomBytes(3).toString('hex')
-}
-
 // atomicWriteJSON writes via a unique temp file and rename, so every reader
 // sees either the old object or the new one (full durability + cleanup
 // discipline lives in audit-io's writeJSONAtomic).

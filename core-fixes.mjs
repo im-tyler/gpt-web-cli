@@ -20,18 +20,19 @@ export function jobId(raw) {
 // createSnapshotWriter renders a sequence of snapshots onto a write-only
 // stream. Appends append; a replacement says so and reprints in full — plain
 // stdout cannot retract bytes, so the honest contract is "a sequence of
-// revisions", not "a prefix of the final reply".
+// revisions", not "a prefix of the final reply". The writer returns the
+// write's result (possibly a promise) so async writers can be awaited; a
+// no-change call returns undefined.
 export function createSnapshotWriter(write) {
   let previous = ''
   return (text) => {
     text = String(text ?? '')
-    if (text === previous) return
-    if (text.startsWith(previous)) {
-      write(text.slice(previous.length))
-    } else {
-      write('\n[reply revised; complete replacement follows]\n' + text)
-    }
+    if (text === previous) return undefined
+    const out = write(
+      text.startsWith(previous) ? text.slice(previous.length) : '\n[reply revised; complete replacement follows]\n' + text
+    )
     previous = text
+    return out
   }
 }
 

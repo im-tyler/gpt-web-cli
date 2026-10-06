@@ -115,19 +115,51 @@ export function openPrivateLog(file) {
 // getBackendJSON performs an authenticated GET against a backend-api path
 // from the page's origin (session cookies + bearer token apply). Read-only;
 // timeout-bounded; never throws for HTTP status — callers decide retryability
-// via response.status.
+// via response.status. The bearer is cached in the page for its TTL: the
+// wait loops poll this helper continuously, and re-fetching
+// /api/auth/session on every tick doubled the request cadence (a metronomic
+// tell, and extra 429 pressure). A 401 invalidates the cache and retries
+// once with a fresh session read.
 export async function getBackendJSON(page, urlPath, timeoutMs = 15000) {
   const result = await page
     .evaluate(async ({ urlPath, timeoutMs }) => {
       try {
-        const s = await (await fetch('/api/auth/session', { credentials: 'include' })).json()
-        const token = s && s.accessToken
+        const readToken = async () => {
+          const cached = window.__cgwBearer
+          if (cached && cached.token && (!cached.exp || cached.exp > Date.now() + 60000)) return cached.token
+          const s = await (
+            await fetch('/api/auth/session', {
+              credentials: 'include',
+              signal: AbortSignal.timeout(timeoutMs),
+            })
+          ).json()
+          const token = s && s.accessToken
+          if (!token) return null
+          let exp = 0
+          try {
+            const seg = String(token).split('.')[1] || ''
+            const b64 = seg.replace(/-/g, '+').replace(/_/g, '/')
+            const payload = JSON.parse(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4)))
+            exp = (Number(payload.exp) || 0) * 1000
+          } catch {}
+          window.__cgwBearer = { token, exp }
+          return token
+        }
+        const call = (token) =>
+          fetch(urlPath, {
+            headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+            credentials: 'include',
+            signal: AbortSignal.timeout(timeoutMs),
+          })
+        let token = await readToken()
         if (!token) return { error: 'no access token' }
-        const r = await fetch(urlPath, {
-          headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
-          credentials: 'include',
-          signal: AbortSignal.timeout(timeoutMs),
-        })
+        let r = await call(token)
+        if (r.status === 401) {
+          window.__cgwBearer = null
+          token = await readToken()
+          if (!token) return { error: 'no access token' }
+          r = await call(token)
+        }
         if (!r.ok) return { status: r.status, error: 'http ' + r.status }
         return { status: r.status, data: await r.json() }
       } catch (e) {
@@ -144,6 +176,73 @@ export async function getBackendJSON(page, urlPath, timeoutMs = 15000) {
     }
   }
   return { ok: true, status: result.status, data: result.data, error: null }
+}
+
+// evaluateBounded races a page.evaluate against a wall-clock bound:
+// evaluate has no default timeout of its own, so an in-page hang (wedged
+// transport, swallowed service-worker interception) suspends the caller
+// forever — and when the caller holds a store flock, that wedges every
+// other CLI process. The losing evaluation settles on its own (its fetches
+// carry abort signals); its eventual rejection is absorbed so it can never
+// surface later as an unhandled one.
+export async function evaluateBounded(page, fn, arg, timeoutMs = 30000, label = 'page evaluation') {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('invalid evaluation timeout')
+  let timer = null
+  try {
+    const evaluation = page.evaluate(fn, arg)
+    evaluation.catch(() => {})
+    return await Promise.race([
+      evaluation,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
+}
+
+// installInterruptionFence gives a FOREGROUND operation (the CLI's dot
+// send) the fencing workers get from runner-entry: an interrupt or fatal
+// process error mid-run files an honest terminal record instead of dying
+// silently for the reaper to misdiagnose as "runner died (pid N)" — which
+// invites a blind retry after a dispatch that may already have landed.
+// `file(detail)` persists the error record; filing is watchdog-bounded and
+// the process exits non-zero afterwards. close() removes the handlers on a
+// normal finish.
+export function installInterruptionFence({ file, exitCode = 130 } = {}) {
+  if (typeof file !== 'function') throw new TypeError('installInterruptionFence needs a file function')
+  let closed = false
+  let filing = false
+  const interrupted = async (why) => {
+    if (closed || filing) return
+    filing = true
+    process.exitCode = exitCode
+    const watchdog = setTimeout(() => process.exit(exitCode), 8000)
+    if (watchdog.unref) watchdog.unref()
+    try {
+      const detail = why ? String(why).slice(0, 160) : ''
+      await file(detail)
+    } catch {}
+    process.exit(exitCode)
+  }
+  const onSignal = (signal) => interrupted(signal)
+  const onFatal = (reason) => interrupted('fatal: ' + String((reason && reason.message) || reason))
+  process.on('SIGINT', onSignal)
+  process.on('SIGTERM', onSignal)
+  process.on('SIGHUP', onSignal)
+  process.on('unhandledRejection', onFatal)
+  process.on('uncaughtException', onFatal)
+  return {
+    close() {
+      closed = true
+      process.off('SIGINT', onSignal)
+      process.off('SIGTERM', onSignal)
+      process.off('SIGHUP', onSignal)
+      process.off('unhandledRejection', onFatal)
+      process.off('uncaughtException', onFatal)
+    },
+  }
 }
 
 // boundedBrowserDownload fetches a descriptor URL inside the page with an

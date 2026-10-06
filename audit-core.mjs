@@ -240,6 +240,45 @@ export async function withRestoredPicker({ snapshot, restore, body }) {
   }
 }
 
+// ----- poll retry classification + cadence (wait loops) ---------------------
+
+// A failed poll inside an API-only wait is read-only: retrying it is
+// unconditionally safe, so the forgiven class is broad. 404 (conversation
+// not yet readable after the send), 5xx, 408/429 (rate limiting is the
+// likeliest answer to polling) and status 0 (client-side failures: a
+// session-endpoint hiccup, an aborted evaluate, a destroyed execution
+// context) all retry to the deadline. 401/403 and anything unknown stay
+// fatal — those mean the session is gone, not that the server hiccuped.
+const RETRIABLE_POLL_STATUSES = [0, 404, 408, 429, 500, 502, 503, 504]
+
+export function retriablePollError(status) {
+  // Strictly-typed: only a KNOWN status number is classified transient.
+  // null/undefined/NaN (no status information) stay fatal — absence of
+  // information is not evidence of a hiccup. (Number(null) === 0 would
+  // otherwise make a statusless error retriable.)
+  return typeof status === 'number' && RETRIABLE_POLL_STATUSES.includes(status)
+}
+
+// Jittered poll cadence — the documented camouflage envelope. A metronomic
+// fixed interval (two requests per tick, same gap, sustained for minutes)
+// is exactly the machine tell the pacing section exists to avoid.
+// 'reply' honors the documented ~0.6–1.3s; 'accept' polls a little wider
+// while the submission settles.
+export function pollDelayMs(phase = 'reply', rand = Math.random) {
+  const lo = phase === 'accept' ? 1200 : 600
+  const hi = phase === 'accept' ? 2500 : 1300
+  return lo + rand() * (hi - lo)
+}
+
+// Backoff across consecutive transient poll failures (status 0 / 429 /
+// 5xx): retry to the deadline, but ease the cadence while the page or the
+// rate limit is unwell instead of hammering at the base interval. A
+// successful poll resets the caller's counter.
+export function pollBackoffMs(consecutive, baseMs, { maxMs = 15000 } = {}) {
+  const n = Number.isSafeInteger(consecutive) ? Math.max(1, consecutive) : 1
+  return Math.min(maxMs, Math.round(baseMs * Math.pow(2, n - 1)))
+}
+
 // ----- dot checkpoints ------------------------------------------------------
 
 const DOT_BACKFILL_MS = 2000
@@ -305,7 +344,12 @@ export function dotPollBatch(msgs, watermark, { limit = 32 } = {}) {
 
 // afterDotSend records a send WITHOUT advancing the read checkpoint: the
 // sent id joins the delivered set, but t and every other delivered id stay,
-// so unread messages older than the send survive for the next poll.
+// so unread messages older than the send survive for the next poll. The
+// bootstrap branch (no prior checkpoint — bind, then send before ever
+// polling) seeds t = 0 for the same reason: a floor at the send time would
+// filter out every unread message older than the send forever. The next
+// poll then delivers full history (at-least-once, consistent with the
+// documented replay semantics).
 export function afterDotSend(current, accepted, prompt, now = Date.now()) {
   if (!current || typeof current !== 'object') {
     throw new TypeError('afterDotSend needs the current dot record')
@@ -315,8 +359,21 @@ export function afterDotSend(current, accepted, prompt, now = Date.now()) {
   const prev = normalizeWatermark(current.watermark)
   const watermark = prev
     ? { v: 2, t: prev.t, ids: [...new Set([...prev.ids, id])] }
-    : { v: 2, t: Number(accepted.at) || 0, ids: [id] }
+    : { v: 2, t: 0, ids: [id] }
   return { ...current, watermark, lastSentAt: now, lastSentText: String(prompt) }
+}
+
+// dotSendInterruption classifies an interrupted FOREGROUND dot send by how
+// far it got. After dispatch (or during the click window) the message may
+// already have landed: the honest filing says so and asks for inspection
+// before any retry — never the reaper's "runner died", which invites a
+// blind duplicate send.
+export function dotSendInterruption(submissionState, detail = '') {
+  const dispatched = ['dispatching', 'dispatched', 'accepted', 'sent'].includes(submissionState)
+  const suffix = detail ? ' (' + detail + ')' : ''
+  return dispatched
+    ? 'dot send interrupted after dispatch — the message may have been sent; inspect the dot thread before retrying' + suffix
+    : 'dot send interrupted before dispatch — nothing was sent; retry is safe' + suffix
 }
 
 // ----- destructive deletes ---------------------------------------------------
@@ -353,6 +410,45 @@ export function planDeletion({ items, listingError, hitCap, deleteIds, deleteAll
     return { error: 'refusing to delete conversations with running turns: ' + clash.join(', ') }
   }
   return { targets: wanted }
+}
+
+// collectConversationListing drives one conversations-listing page fetch at
+// a time and decides completeness honestly. A short page proves the end. A
+// FULL page at the item cap proves nothing either way: an inventory of
+// exactly `cap` items is complete when the next page is empty and capped
+// when it is not — one boundary probe decides, instead of reporting every
+// at-cap listing as truncated (which also refused legitimate
+// `chats --delete --all --yes` runs). fetchPage(offset) resolves
+// {items} or {error}; pure so the pagination contract is testable.
+export async function collectConversationListing(fetchPage, { limit = 50, cap = 200 } = {}) {
+  const items = []
+  let lastError = null
+  let hitCap = false
+  let offset = 0
+  for (;;) {
+    const page = await fetchPage(offset)
+    if (!page || page.error) {
+      lastError = (page && page.error) || 'listing fetch failed'
+      break
+    }
+    const batch = Array.isArray(page.items) ? page.items : []
+    items.push(...batch)
+    if (batch.length < limit) break // a short page proves completeness
+    if (items.length >= cap) {
+      // Boundary probe. A probe failure is treated as capped AND errored:
+      // completeness is unproven, and destructive deletes refuse on either.
+      const probe = await fetchPage(offset + limit)
+      if (!probe || probe.error) {
+        lastError = (probe && probe.error) || 'listing boundary probe failed'
+        hitCap = true
+        break
+      }
+      hitCap = (probe.items || []).length > 0
+      break
+    }
+    offset += limit
+  }
+  return { items, lastError, hitCap }
 }
 
 // ----- wait generation pinning ------------------------------------------------
@@ -450,11 +546,20 @@ export function parseCli(argv) {
       }
       if (token in VALUE_OPTIONS) {
         const next = raw[i + 1]
+        // An optional value (--context) defaults whenever the value is
+        // absent — at end of argv OR before another flag. Defaulting only
+        // at end-of-argv made the documented `dot --context --json` form
+        // silently run status instead (A2).
         if (OPTIONAL_VALUE.has(token) && (next === undefined || next.startsWith('--'))) {
-          if (next === undefined) values[VALUE_OPTIONS[token]] = values[VALUE_OPTIONS[token]] ?? 20 // bare --context at the end
+          values[VALUE_OPTIONS[token]] = values[VALUE_OPTIONS[token]] ?? 20
           continue
         }
-        if (next === undefined) throw new Error(`${token} needs a value`)
+        // A required value must not swallow a flag-looking token:
+        // `start --file --stream "hi"` used to error as "no such file:
+        // --stream" and `wait id --turn --json` ate --json as the value.
+        if (next === undefined || next.startsWith('--') || /^-[a-z]$/i.test(next)) {
+          throw new Error(`${token} needs a value`)
+        }
         const key = VALUE_OPTIONS[token]
         values[key] = key === 'file' ? [...(values.file || []), next] : next
         i++
@@ -502,10 +607,17 @@ export function parseCli(argv) {
     if (options.delete && !options.all && args.length === 0) {
       throw new Error('chats --delete needs chat ids, or --all (with --yes)')
     }
+    // Operands only mean something to --delete; a bare `chats some-id` used
+    // to list everything and silently ignore the id.
+    if (!options.delete && args.length) {
+      throw new Error('chats takes no arguments — to hide chats: chats --delete <id>...')
+    }
   }
   if (command === 'dot') {
+    // After the parser fix, context is always the number 20 or a numeric
+    // string here — the old `=== true` branch was unreachable dead code.
     if (options.context !== undefined) {
-      options.context = options.context === true ? 20 : positiveInteger(options.context, 'context count', { min: 1, max: 32 })
+      options.context = positiveInteger(options.context, 'context count', { min: 1, max: 32 })
     }
     const modes = [options.poll, options.reset, options.context !== undefined, args.length > 0].filter(Boolean).length
     if (modes > 1) throw new Error('dot: choose one of a message, --poll, --context [n], --reset')

@@ -26,6 +26,11 @@ import {
   dotPollBatch,
   afterDotSend,
   assertDotWindow,
+  retriablePollError,
+  pollDelayMs,
+  pollBackoffMs,
+  collectConversationListing,
+  dotSendInterruption,
 } from './audit-core.mjs'
 import { writeJSONAtomic, readJSONStrict, validateUploads, ARTIFACT_MAX_BYTES } from './audit-io.mjs'
 import { attachmentVerdict } from './core-fixes.mjs'
@@ -283,9 +288,18 @@ test('afterDotSend does not advance the read checkpoint past unread messages', (
   // clobbered them).
   const batch2 = dotPollBatch([M('unread', 1100, false, 'missed me'), M('sent1', 5000, true, 'ping')], out.watermark, { limit: 32 })
   assert.deepEqual(batch2.messages.map((m) => m.id), ['unread'])
-  // No prior checkpoint: the sent message seeds one.
+  // No prior checkpoint (bind, then send before ever polling): the send
+  // seeds one WITHOUT a time floor. A bootstrap t at the send time used to
+  // filter out every unread message older than the send forever — the exact
+  // silent-history-loss class v2 exists to close (A6).
   const fresh = afterDotSend({ roomId: 'r', watermark: null }, { id: 's', at: 42 }, 'x')
-  assert.deepEqual(fresh.watermark, { v: 2, t: 42, ids: ['s'] })
+  assert.deepEqual(fresh.watermark, { v: 2, t: 0, ids: ['s'] })
+  const bootstrap = dotPollBatch(
+    [M('older', 40, false, 'unread before the first send'), M('s', 42, true, 'x')],
+    fresh.watermark,
+    { limit: 32 }
+  )
+  assert.deepEqual(bootstrap.messages.map((m) => m.id), ['older'], 'pre-send history survives the bootstrap send')
 })
 
 // ----- P09: deletion planning --------------------------------------------------
@@ -311,6 +325,128 @@ test('parseCli: dot -- --poll is a MESSAGE, not a flag', () => {
   assert.deepEqual(args, ['--poll'])
   assert.equal(options.poll, undefined)
 })
+
+// A2: the documented `dot --context --json` form used to silently run
+// status (both flags dropped), and `dot --context --poll` silently ran
+// poll alone — advancing the watermark uninvited.
+test('parseCli: bare --context defaults before any flag, not only at end of argv (A2)', () => {
+  const p = parseCli(['dot', '--context', '--json'])
+  assert.equal(p.command, 'dot')
+  assert.deepEqual(p.options, { file: [], context: 20, json: true })
+  assert.throws(() => parseCli(['dot', '--context', '--poll']), /choose one/)
+  // Guard: the already-working orders keep working.
+  assert.equal(parseCli(['dot', '--json', '--context']).options.context, 20)
+  assert.equal(parseCli(['dot', '--context']).options.context, 20)
+  assert.equal(parseCli(['dot', '--context', '8', '--json']).options.context, 8)
+})
+
+// A9: required option values must not swallow flag-looking tokens.
+test('parseCli: required value options refuse flag-like values (A9)', () => {
+  assert.throws(() => parseCli(['start', 'p', '--file', '--stream']), /--file needs a value/)
+  assert.throws(() => parseCli(['wait', 'id', '--turn', '--json']), /--turn needs a value/)
+  assert.throws(() => parseCli(['start', 'p', '-f']), /needs a value/)
+  assert.deepEqual(parseCli(['start', 'p', '--file', 'a.png']).options.file, ['a.png'])
+  assert.match(
+    parseCli(['wait', 'job-1', '--turn', '11111111-1111-1111-1111-111111111111']).options.turn,
+    /^11111111/
+  )
+})
+
+// A9: `chats some-id` used to list everything and silently ignore the id.
+test('parseCli: chats rejects stray operands outside --delete (A9)', () => {
+  assert.throws(() => parseCli(['chats', 'some-id']), /chats takes no arguments/)
+  assert.doesNotThrow(() => parseCli(['chats']))
+  assert.doesNotThrow(() => parseCli(['chats', '--delete', 'some-id']))
+  assert.doesNotThrow(() => parseCli(['chats', '--delete', '--all', '--yes']))
+})
+
+// ----- A1: poll retry classification ----------------------------------------------
+
+test('retriablePollError forgives transient classes; auth failures stay fatal (A1)', () => {
+  for (const s of [0, 404, 408, 429, 500, 502, 503, 504]) {
+    assert.equal(retriablePollError(s), true, 'status ' + s + ' is retriable')
+  }
+  for (const s of [200, 400, 401, 403, 405, 418, undefined, null, 'x']) {
+    assert.equal(retriablePollError(s), false, 'status ' + String(s) + ' is fatal')
+  }
+})
+
+test('pollBackoffMs grows exponentially across consecutive failures and caps (A1)', () => {
+  assert.equal(pollBackoffMs(0, 800), 800)
+  assert.equal(pollBackoffMs(1, 800), 800)
+  assert.equal(pollBackoffMs(2, 800), 1600)
+  assert.equal(pollBackoffMs(3, 800), 3200)
+  assert.equal(pollBackoffMs(4, 800), 6400)
+  assert.equal(pollBackoffMs(10, 800), 15000, 'capped at 15s')
+  assert.equal(pollBackoffMs(99, 20000), 15000, 'never above the cap')
+})
+
+// A7: the wait loops dropped the documented jittered cadence for a fixed
+// metronomic interval — restore-and-pin the envelope.
+test('pollDelayMs jitters inside the documented camouflage envelope (A7)', () => {
+  let lo = Infinity
+  let hi = -Infinity
+  let varies = false
+  let prev = null
+  for (let i = 0; i < 200; i++) {
+    const d = pollDelayMs('reply')
+    assert.ok(d >= 600 && d <= 1300, 'reply cadence within ~0.6-1.3s')
+    lo = Math.min(lo, d)
+    hi = Math.max(hi, d)
+    if (prev !== null && d !== prev) varies = true
+    prev = d
+  }
+  assert.ok(varies, 'the cadence varies — not a metronome')
+  assert.ok(hi - lo > 100, `observed spread is real (${lo.toFixed(0)}..${hi.toFixed(0)}ms)`)
+  for (let i = 0; i < 50; i++) {
+    const d = pollDelayMs('accept')
+    assert.ok(d >= 1200 && d <= 2500, 'accept cadence bounds')
+  }
+})
+
+// ----- A8: listing pagination ------------------------------------------------------
+
+const pageOf = (n, off) => Array.from({ length: n }, (_, i) => ({ id: 'c' + (off + i) }))
+
+test('collectConversationListing: exactly-cap inventory is complete, not capped (A8)', async () => {
+  const fourFullThenEmpty = async (offset) => (offset < 200 ? { items: pageOf(50, offset) } : { items: [] })
+  const r = await collectConversationListing(fourFullThenEmpty)
+  assert.equal(r.items.length, 200)
+  assert.equal(r.hitCap, false, '4×50 then an empty boundary page proves completeness')
+  assert.equal(r.lastError, null)
+
+  const fiveFull = async (offset) => ({ items: pageOf(50, offset) })
+  const capped = await collectConversationListing(fiveFull)
+  assert.equal(capped.hitCap, true, 'a full boundary page means more beyond the cap')
+  assert.equal(capped.items.length, 200)
+
+  const short = async (offset) => (offset === 0 ? { items: pageOf(30, 0) } : { items: [] })
+  const s = await collectConversationListing(short)
+  assert.equal(s.hitCap, false, 'a short page proves completeness without a probe')
+
+  const errMidListing = async (offset) => (offset === 0 ? { items: pageOf(50, 0) } : { error: 'http 500' })
+  const e = await collectConversationListing(errMidListing)
+  assert.equal(e.lastError, 'http 500')
+  assert.equal(e.items.length, 50, 'partial rows stay honest')
+
+  const probeFails = async (offset) => (offset < 200 ? { items: pageOf(50, offset) } : { error: 'http 429' })
+  const p = await collectConversationListing(probeFails)
+  assert.equal(p.hitCap, true, 'an unprovable boundary is treated as capped (fail closed)')
+  assert.equal(p.lastError, 'http 429')
+})
+
+// ----- A5: foreground dot-send interruption classification --------------------------
+
+test('dotSendInterruption classifies by dispatch progress, never as a runner crash (A5)', () => {
+  assert.match(dotSendInterruption('dispatched'), /may have been sent; inspect the dot thread before retrying/)
+  assert.match(dotSendInterruption('dispatching'), /may have been sent/, 'the click window counts as uncertain')
+  assert.match(dotSendInterruption('accepted'), /may have been sent/)
+  const early = dotSendInterruption(undefined)
+  assert.match(early, /nothing was sent; retry is safe/)
+  assert.doesNotMatch(early, /runner died/)
+  assert.doesNotMatch(dotSendInterruption('dispatched'), /runner died/)
+})
+
 
 test('parseCli: shapes, counts, values and combinations', () => {
   assert.deepEqual(parseCli(['start', 'hi', '--file', 'a.png', '-f', 'b.png']).options.file, ['a.png', 'b.png'])
