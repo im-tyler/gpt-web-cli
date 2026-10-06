@@ -1,13 +1,20 @@
 {
   "name": "chatgpt-web",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "bin": {
     "chatgpt-web": "cli.mjs"
   },
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check cli.mjs && node --check runner.mjs && node --check runner-entry.mjs && node --check jobs.mjs && node --check turn-store.mjs && node --check audit-core.mjs && node --check audit-io.mjs"
+  },
   "dependencies": {
     "fs-ext": "2.1.1",
-    "playwright-core": "^1.49.0"
+    "playwright-core": "1.63.0"
   }
 }

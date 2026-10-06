@@ -2,7 +2,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execSync, execFileSync, execFile } from 'node:child_process'
-import crypto from 'node:crypto'
 import { chromium } from 'playwright-core'
 import {
   PROFILE_DIR,
@@ -13,9 +12,11 @@ import {
   updateState,
   updateDot,
   readDot,
+  readJob,
   turns,
   readState,
   runningJobs,
+  withStoreLock,
 } from './jobs.mjs'
 import {
   positiveInteger,
@@ -28,65 +29,102 @@ import {
   dedupeByFileId,
   attachmentVerdict,
 } from './core-fixes.mjs'
+import {
+  AuditError,
+  canonicalPrompt,
+  samePrompt,
+  conversationId,
+  conversationUrl,
+  conversationSnapshot,
+  findAcceptedUser,
+  inspectReply,
+  parseSliderDescription,
+  sliderEqual,
+  withRestoredPicker,
+  dotPollBatch,
+  afterDotSend,
+  assertDotWindow,
+  planDeletion,
+  integerEnv,
+} from './audit-core.mjs'
+import {
+  getBackendJSON,
+  writeOutput,
+  validateUploads,
+  writeJSONAtomic,
+  boundedBrowserDownload,
+  ARTIFACT_MAX_BYTES,
+} from './audit-io.mjs'
 
 const jitter = (a, b) => a + Math.random() * (b - a)
 
 const CHAT_URL = 'https://chatgpt.com/'
-const TURN_TIMEOUT_MS = (() => {
-  try {
-    return positiveInteger(process.env.CHATGPT_WEB_TIMEOUT ?? '300', 'CHATGPT_WEB_TIMEOUT', { max: 86400 }) * 1000
-  } catch (e) {
-    console.error(String(e.message))
-    process.exit(1)
+
+// Importing the runner installs no handlers, starts nothing and exits for
+// nothing: environment validation happens in validateRunnerConfig(), called
+// by the worker entry (and lazily wherever the config is first needed).
+let cachedRunnerConfig = null
+export function validateRunnerConfig() {
+  if (cachedRunnerConfig) return cachedRunnerConfig
+  cachedRunnerConfig = {
+    turnTimeoutMs:
+      integerEnv(process.env, 'CHATGPT_WEB_TIMEOUT', 300, { min: 1, max: 86400 }) * 1000,
+    cdpPort: String(integerEnv(process.env, 'CHATGPT_WEB_CDP_PORT', 9777, { min: 1, max: 65535 })),
   }
-})()
-const CDP_PORT = String((() => {
-  try {
-    return positiveInteger(process.env.CHATGPT_WEB_CDP_PORT ?? '9777', 'CHATGPT_WEB_CDP_PORT', { max: 65535 })
-  } catch (e) {
-    console.error(String(e.message))
-    process.exit(1)
-  }
-})())
-const CDP_URL = 'http://127.0.0.1:' + CDP_PORT
+  return cachedRunnerConfig
+}
+
+const cdpUrl = () => 'http://127.0.0.1:' + validateRunnerConfig().cdpPort
 
 const COMPOSER_SEL = '#prompt-textarea, textarea[data-id], div[contenteditable="true"]'
-const ASSISTANT_SEL = '[data-message-author-role="assistant"]'
-const USER_SEL = '[data-message-author-role="user"]'
 const MESSAGE_SEL = '[data-message-author-role]'
-const MESSAGE_ID_ATTR = 'data-message-id'
-const STOP_SEL = '[data-testid="stop-button"], button[aria-label*="stop" i]'
 const SUBMIT_SEL = '#composer-submit-button, [data-testid="send-button"], button[aria-label="Send"]'
 const LOGIN_SEL = '[data-testid="login-button"], button:has-text("Log in")'
 const NEW_CHAT_SEL = 'nav a[href="/"], [data-testid*="new-chat"] a, a:has-text("New chat")'
+// Candidate attachment cards in the composer scope, plus the attachment
+// slot itself. Live fixture (2026-10-06, main-chat surface): the composer's
+// FORM scope contains a `ComposerLayoutAttachments-*` container with ZERO
+// element children when no attachments exist — a structural empty-state
+// sentinel. Cards inside it, or legacy chips in the scope, indicate
+// attachments; their STATE is never guessed from visible text — only a
+// fixture-backed profile may map card attributes to ready/uploading/error.
+const ATTACH_CHIP_SEL =
+  '[data-testid*="attach" i], [data-testid*="file" i], [class*="attachment" i], [class*="file-tile" i]'
+const ATTACH_CONTAINER_SEL = '[class*="ComposerLayoutAttachments"]'
 
-// A detached promise rejection (the 2026-09-09 filechooser-timeout crash
-// class) used to kill the worker with no job state, leaving "runner died"
-// as the only diagnosis. The net: the rejection is filed into the turn this
-// process owns and the process exits non-zero instead of crashing. Known
-// waitFor* sites carry their own inline catches; this catches the unknown
-// ones. Without an active turn (command paths) it only records the failure.
-let activeTurn = null
+// ----- worker fencing (fatal errors abort before further mutation) -------
 
-export function registerActiveTurn(jobId, turnId) {
-  activeTurn = jobId && turnId ? { jobId, turnId } : null
+const operation = new AbortController()
+let ownedPage = null
+
+export function abortRunner(error) {
+  operation.abort(error) // synchronous: prevents later browser mutations
+  return ownedPage ? ownedPage.close().catch(() => {}) : Promise.resolve()
 }
 
-process.on('unhandledRejection', (reason) => {
-  const msg = 'unhandled rejection: ' + (reason && reason.message ? reason.message : String(reason))
-  console.error(msg)
-  process.exitCode = 1
-  if (!activeTurn) return
-  const { jobId, turnId } = activeTurn
-  turns
-    .update(jobId, turnId, (j) => {
-      if (j.status !== 'error') {
-        j.status = 'error'
-        j.error = msg
-      }
-    })
-    .catch(() => {})
-})
+function assertRunnerLive() {
+  operation.signal.throwIfAborted()
+}
+
+async function ownedUpdate(id, turnId, mutate) {
+  assertRunnerLive()
+  const updated = await turns.update(id, turnId, mutate)
+  if (!updated) throw new AuditError('TURN_OWNERSHIP_LOST', 'turn no longer belongs to this worker')
+  return updated
+}
+
+function assertOwnedBeforeMutation(id, turnId) {
+  assertRunnerLive()
+  const current = readJob(id)
+  if (
+    !current ||
+    current.turnId !== turnId ||
+    current.pid !== process.pid ||
+    !['running', 'streaming'].includes(current.status)
+  ) {
+    throw new AuditError('TURN_OWNERSHIP_LOST', 'refusing browser mutation for a stale turn')
+  }
+}
 
 function convIdOf(url) {
   const m = String(url || '').match(/\/c\/([0-9a-fA-F-]{8,})/)
@@ -96,21 +134,6 @@ function convIdOf(url) {
 function normText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim()
 }
-
-// Agent-mode storage autolinks bare URLs ("audit https://x" becomes
-// "audit [https://x](https://x)"). Strip self-labeled links before any
-// prompt-identity comparison against stored message text.
-function normStoredPrompt(s) {
-  return normText(String(s || '').replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, a, b) => (a === b ? a : m)))
-}
-
-// Only line endings are normalized for prompt comparison: broad whitespace
-// collapsing can alter code prompts.
-const normPrompt = (s) =>
-  String(s || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\n{2,}/g, '\n')
-    .trim()
 
 function debugLog(...args) {
   if (process.env.CHATGPT_WEB_DEBUG !== '1') return
@@ -151,7 +174,7 @@ function chromeIsHeadlessBin() {
 
 function setDaemonVisible(show) {
   if (process.platform !== 'darwin') return
-  const pid = listenerPid(CDP_PORT)
+  const pid = listenerPid(validateRunnerConfig().cdpPort)
   if (!pid) return
   try {
     execSync(
@@ -192,7 +215,7 @@ async function hideDaemon() {
 
 async function cdpVersion() {
   try {
-    const res = await fetch(CDP_URL + '/json/version', { signal: AbortSignal.timeout(1500) })
+    const res = await fetch(cdpUrl() + '/json/version', { signal: AbortSignal.timeout(1500) })
     if (!res.ok) return null
     return await res.json()
   } catch {
@@ -217,15 +240,13 @@ function readDaemonIdentity() {
 }
 
 function writeDaemonIdentity({ pid, websocketUrl }) {
-  const body = JSON.stringify(
-    { pid, profileDir: fs.realpathSync(PROFILE_DIR), port: Number(CDP_PORT), websocketUrl, at: Date.now() },
-    null,
-    2
-  )
-  const tmp = DAEMON_FILE + '.' + crypto.randomUUID() + '.tmp'
-  fs.mkdirSync(path.dirname(DAEMON_FILE), { recursive: true })
-  fs.writeFileSync(tmp, body, { mode: 0o600 })
-  fs.renameSync(tmp, DAEMON_FILE)
+  writeJSONAtomic(DAEMON_FILE, {
+    pid,
+    profileDir: fs.realpathSync(PROFILE_DIR),
+    port: Number(validateRunnerConfig().cdpPort),
+    websocketUrl,
+    at: Date.now(),
+  })
 }
 
 async function verifyDaemonIdentity() {
@@ -233,8 +254,8 @@ async function verifyDaemonIdentity() {
   const ident = readDaemonIdentity()
   const live = {
     profileDir: fs.realpathSync(PROFILE_DIR),
-    port: Number(CDP_PORT),
-    pid: listenerPid(CDP_PORT),
+    port: Number(validateRunnerConfig().cdpPort),
+    pid: listenerPid(validateRunnerConfig().cdpPort),
     websocketUrl: version?.webSocketDebuggerUrl,
   }
   const valid = (value) =>
@@ -262,7 +283,15 @@ async function verifyDaemonIdentity() {
   return live
 }
 
-async function ensureBrowser() {
+// The WHOLE ensure/reuse decision is serialized, not just the spawn: a
+// second process used to inspect a newly listening browser before the
+// first had published its identity, and failed the verification spuriously.
+// Identity publication stays inside the lock.
+async function ensureBrowser(options = {}) {
+  return withLock('daemon-startup', () => ensureBrowserLocked(options), { timeoutMs: 120000 })
+}
+
+async function ensureBrowserLocked(options = {}) {
   const version = await cdpVersion()
   if (version) {
     if (chromeIsHeadlessBin()) {
@@ -271,79 +300,70 @@ async function ensureBrowser() {
       )
     }
     const identity = await verifyDaemonIdentity()
-    if (wantHeadless()) await hideDaemon()
+    if (wantHeadless() && !options.keepVisible) await hideDaemon()
     return identity
   }
-  // Startup is serialised: two cold starts racing each spawned Chrome, and
-  // the loser diagnosed the winner's not-yet-ready port as a profile
-  // without debugging.
-  await withLock(
-    'daemon-startup',
-    async () => {
-      if (await cdpVersion()) return
-      if (profileBusyArgv(PROFILE_DIR)) {
-        throw new Error('chatgpt-web Chrome is open without remote debugging — quit it (Cmd+Q) and retry')
-      }
-      const bin = chromeBinary()
-      if (!bin) throw new Error('no Chrome binary found — set CHATGPT_WEB_CHROME=/path/to/chrome')
-      const args = [
-        '--remote-debugging-port=' + CDP_PORT,
-        '--user-data-dir=' + PROFILE_DIR,
-        '--no-first-run',
-        '--no-default-browser-check',
-        'about:blank',
-      ]
-      // Awaitable startup: a non-executable path rejects here, inside the
-      // caller's control flow, instead of throwing from an event handler
-      // nothing can catch.
-      const child = await spawnStarted(bin, args, { detached: true, stdio: 'ignore' })
-      child.unref()
-      // Real Chrome launches foregrounded and paints before the debugging
-      // port answers, so hidden mode re-asserts visibility on the spawned
-      // pid from the first moment — the launch flash stays a blink instead
-      // of stealing the operator's keyboard for the whole startup.
-      const hideTimer = wantHeadless() ? startHideLoop(child.pid) : null
-      try {
-        const deadline = Date.now() + 20000
-        while (Date.now() < deadline) {
-          const v = await cdpVersion()
-          if (v) {
-            // Record identity only once the launched child provably owns the
-            // listener; never adopt whatever happened to come up.
-            if (listenerPid(CDP_PORT) !== child.pid) {
-              throw new Error('another process took the debugging port during startup — retry')
-            }
-            writeDaemonIdentity({ pid: child.pid, websocketUrl: v.webSocketDebuggerUrl })
-            return
-          }
-          try {
-            process.kill(child.pid, 0)
-          } catch {
-            throw new Error('chatgpt-web Chrome exited immediately after starting')
-          }
-          await sleep(300)
+  if (profileBusyArgv(PROFILE_DIR)) {
+    throw new Error('chatgpt-web Chrome is open without remote debugging — quit it (Cmd+Q) and retry')
+  }
+  const bin = chromeBinary()
+  if (!bin) throw new Error('no Chrome binary found — set CHATGPT_WEB_CHROME=/path/to/chrome')
+  const args = [
+    '--remote-debugging-port=' + validateRunnerConfig().cdpPort,
+    '--user-data-dir=' + PROFILE_DIR,
+    '--no-first-run',
+    '--no-default-browser-check',
+    'about:blank',
+  ]
+  // Awaitable startup: a non-executable path rejects here, inside the
+  // caller's control flow, instead of throwing from an event handler
+  // nothing can catch.
+  const child = await spawnStarted(bin, args, { detached: true, stdio: 'ignore' })
+  child.unref()
+  // Real Chrome launches foregrounded and paints before the debugging
+  // port answers, so hidden mode re-asserts visibility on the spawned
+  // pid from the first moment — the launch flash stays a blink instead
+  // of stealing the operator's keyboard for the whole startup. Login
+  // (keepVisible) opts out: its window must stay visible.
+  const hideTimer = wantHeadless() && !options.keepVisible ? startHideLoop(child.pid) : null
+  try {
+    const deadline = Date.now() + 20000
+    let version = null
+    while (Date.now() < deadline && !version) {
+      version = await cdpVersion()
+      if (!version) {
+        try {
+          process.kill(child.pid, 0)
+        } catch {
+          throw new Error('chatgpt-web Chrome exited immediately after starting')
         }
-        throw new Error('chatgpt-web Chrome started but the debugging port never came up')
-      } finally {
-        if (hideTimer) clearInterval(hideTimer)
+        await sleep(300)
       }
-    },
-    { staleMs: 60000, timeoutMs: 120000 }
-  )
+    }
+    if (!version) throw new Error('chatgpt-web Chrome started but the debugging port never came up')
+    // Record identity only once the launched child provably owns the
+    // listener; never adopt whatever happened to come up.
+    if (listenerPid(validateRunnerConfig().cdpPort) !== child.pid) {
+      throw new Error('another process took the debugging port during startup — retry')
+    }
+    writeDaemonIdentity({ pid: child.pid, websocketUrl: version.webSocketDebuggerUrl })
+  } finally {
+    if (hideTimer) clearInterval(hideTimer)
+  }
   const identity = await verifyDaemonIdentity()
-  if (wantHeadless()) await hideDaemon()
+  if (wantHeadless() && !options.keepVisible) await hideDaemon()
   return identity
 }
 
 async function ensurePageTarget() {
   let tabs = []
   try {
-    tabs = await (await fetch(CDP_URL + '/json', { signal: AbortSignal.timeout(1500) })).json()
+    tabs = await (await fetch(cdpUrl() + '/json', { signal: AbortSignal.timeout(1500) })).json()
   } catch {
     return
   }
   if (Array.isArray(tabs) && tabs.some((t) => t.type === 'page')) return
-  await fetch(CDP_URL + '/json/new?about:blank', { method: 'PUT', signal: AbortSignal.timeout(2000) }).catch(() => {})
+  await fetch(cdpUrl() + '/json/new?about:blank', { method: 'PUT', signal: AbortSignal.timeout(2000) }).catch(() => {})
 }
 
 // withPage owns a command's tab. In hidden mode it also re-asserts daemon
@@ -352,27 +372,40 @@ async function ensurePageTarget() {
 // stole focus and dropped the operator's keystrokes into Chrome. The loop
 // shrinks any steal to the next tick. Login opts out — its window must be
 // visible for the human.
+//
+// Visibility itself is lock-coordinated: ordinary pages hold a SHARED
+// browser-visibility flock for their lifetime (they overlap freely), while
+// login holds it EXCLUSIVELY for its whole run, so no other command's hide
+// timer can fight the human's login window.
 async function withPage(fn, { keepVisible = false } = {}) {
-  const identity = await ensureBrowser()
-  // Connect through the verified browser endpoint, not the mutable HTTP
-  // port; the tab is created through this connection.
-  const browser = await chromium.connectOverCDP(identity.websocketUrl, { noDefaults: true })
-  let page = null
-  let hideTimer = null
-  try {
-    const context = browser.contexts()[0]
-    if (!context) throw new Error('no default context over CDP')
-    if (wantHeadless() && !keepVisible) {
-      hideTimer = startHideLoop(identity.pid)
-    }
-    page = await context.newPage()
-    return await fn(page)
-  } finally {
-    if (hideTimer) clearInterval(hideTimer)
-    if (page) await page.close().catch(() => {})
-    await browser.close().catch(() => {})
-    if (wantHeadless() && !keepVisible) await hideDaemon()
-  }
+  return withLock(
+    'browser-visibility',
+    async () => {
+      const identity = await ensureBrowser({ keepVisible })
+      // Connect through the verified browser endpoint, not the mutable HTTP
+      // port; the tab is created through this connection.
+      const browser = await chromium.connectOverCDP(identity.websocketUrl, { noDefaults: true })
+      let page = null
+      let hideTimer = null
+      try {
+        const context = browser.contexts()[0]
+        if (!context) throw new Error('no default context over CDP')
+        if (wantHeadless() && !keepVisible) {
+          hideTimer = startHideLoop(identity.pid)
+        }
+        page = await context.newPage()
+        ownedPage = page
+        return await fn(page)
+      } finally {
+        ownedPage = null
+        if (hideTimer) clearInterval(hideTimer)
+        if (page) await page.close().catch(() => {})
+        await browser.close().catch(() => {})
+        if (wantHeadless() && !keepVisible) await hideDaemon()
+      }
+    },
+    { shared: !keepVisible }
+  )
 }
 
 async function classifyPage(page, deadlineMs = 20000) {
@@ -505,36 +538,21 @@ async function assertBoundConversation(page, job) {
   throw new Error(`tab is not on the job's conversation (want ${want}, at ${page.url()}) — refusing to send`)
 }
 
-// userIds snapshots mounted user-message identities, for accepted-turn
-// verification below.
-async function userIds(page) {
-  return page
-    .locator(USER_SEL)
-    .evaluateAll((els, attr) => els.map((el) => el.closest('[' + attr + ']')?.getAttribute(attr) || '').filter(Boolean), MESSAGE_ID_ATTR)
-    .catch(() => [])
-}
-
-async function assistantIds(page) {
-  return page
-    .locator(ASSISTANT_SEL)
-    .evaluateAll((els, attr) => els.map((el) => el.closest('[' + attr + ']')?.getAttribute(attr) || '').filter(Boolean), MESSAGE_ID_ATTR)
-    .catch(() => [])
-}
-
 // sendPromptGuarded submits through one browser evaluation with no async
-// gap: it re-validates the destination route and that the composer still
-// holds this prompt, then clicks an enabled button. The old final check
-// looked only at the button, so a navigation during the ready-wait could
-// submit into whatever page was showing; the fallback Enter press is gone.
-async function sendPromptGuarded(page, { boundUrl, prompt }) {
-  const bound = boundUrl ? new URL(boundUrl) : null
-  const route = bound?.pathname.match(/^\/c\/([0-9a-fA-F-]{8,})\/?$/)
-  if (bound && (bound.origin !== 'https://chatgpt.com' || !route)) {
-    throw new Error('invalid bound conversation URL')
-  }
+// gap: it re-validates the destination route, that the composer still holds
+// exactly this prompt, the attachment set at the click boundary, and a
+// unique visible enabled Send button — then clicks. The composer and button
+// must be the UNIQUE visible match (querySelector/.first() could grab a
+// hidden template element). The fallback Enter press is gone; the DOM
+// priorIds collection is gone too — the acceptance baseline is the
+// conversation API, taken in the caller before this runs.
+async function sendPromptGuarded(page, { boundUrl, prompt, files = [] }) {
+  const bound = boundUrl ? conversationUrl(boundUrl) : null
+  const route = bound ? conversationId(bound) : null
+  const expected = [...(files || [])].map((f) => path.basename(f)).sort()
   const result = await page
     .evaluate(
-      ({ wantConv, promptText, selectors }) => {
+      ({ wantConv, promptText, selectors, expected }) => {
         if (location.origin !== 'https://chatgpt.com') return { error: 'unexpected origin' }
         const current = location.pathname.match(/^\/c\/([0-9a-fA-F-]{8,})\/?$/)
         if (wantConv) {
@@ -542,132 +560,233 @@ async function sendPromptGuarded(page, { boundUrl, prompt }) {
         } else if (location.pathname !== '/' || document.querySelectorAll(selectors.messages).length !== 0) {
           return { error: 'fresh-chat destination changed before submission' }
         }
-        const composer = document.querySelector(selectors.composer)
-        if (!composer) return { error: 'composer disappeared before submission' }
+        const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden'
+        const composers = [...document.querySelectorAll(selectors.composer)].filter(visible)
+        if (composers.length !== 1) {
+          return {
+            error: composers.length === 0 ? 'composer disappeared before submission' : 'multiple composers visible before submission',
+          }
+        }
+        const composer = composers[0]
         const text = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
-        // Whitespace-flattened compare: the 2026-10 contenteditable can
-        // render a paragraph break inside the typed prompt (observed at the
-        // first token boundary); authored identity is verified via the API
-        // after send, so a rendered break is not a divergence.
-        const flat = text.replace(/\s+/g, ' ').trim()
-        if (flat !== promptText) return { error: 'composer changed before submission', saw: flat.slice(0, 90) }
-        const button = document.querySelector(selectors.submit)
-        if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') {
+        // Exact authored text, line endings normalized only. Broad
+        // whitespace flattening used to accept a different prompt; a
+        // rendering-level divergence is a real refusal.
+        const actual = String(text).replace(/\r\n/g, '\n')
+        if (actual !== promptText) return { error: 'composer changed before submission', saw: actual.slice(0, 90) }
+        // Attachment evidence at the click boundary (same evaluation — no
+        // time-of-check/time-of-use gap). The ComposerLayoutAttachments
+        // slot with zero children is the structural empty-state sentinel
+        // (fixture 2026-10-06); a populated slot or legacy chips must be
+        // exactly the requested multiset.
+        const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement
+        if (!scope) return { error: 'composer scope unrecognized before submission' }
+        const container = scope.querySelector(selectors.attachContainer)
+        let names = null
+        if (container) {
+          if (container.childElementCount === 0) {
+            names = []
+          } else {
+            names = [...container.children].map((card) => {
+              const chip = card.matches(selectors.chips) ? card : card.querySelector(selectors.chips)
+              return ((chip ? chip.innerText : card.innerText) || '').trim().split('\n')[0]?.trim() || null
+            })
+            if (names.includes(null)) return { error: 'attachment present without a readable name; refusing submission' }
+          }
+        } else {
+          const chips = Array.from(scope.querySelectorAll(selectors.chips)).filter(
+            (el) => el.closest('[data-message-author-role]') === null
+          )
+          names = []
+          for (const chip of chips) {
+            const name = (chip.innerText || '').trim().split('\n')[0]?.trim() || ''
+            if (!name) return { error: 'attachment present without a readable name; refusing submission' }
+            names.push(name)
+          }
+        }
+        const got = [...names].sort()
+        if (got.length !== expected.length || got.some((n, i) => n !== expected[i])) {
+          return {
+            error: expected.length ? 'attachment set changed before submission' : 'unexpected attachments present before submission',
+            saw: got,
+          }
+        }
+        const buttons = [...document.querySelectorAll(selectors.submit)].filter(visible)
+        if (buttons.length !== 1) {
+          return {
+            error: buttons.length === 0 ? 'send button is missing' : 'multiple send buttons visible before submission',
+          }
+        }
+        const button = buttons[0]
+        if (button.disabled || button.getAttribute('aria-disabled') === 'true') {
           return { error: 'send button is disabled' }
         }
-        const priorIds = Array.from(document.querySelectorAll(selectors.users), (el) =>
-          el.closest('[' + selectors.idAttr + ']')?.getAttribute(selectors.idAttr)
-        )
-        if (priorIds.some((id) => !id)) return { error: 'cannot identify existing user messages' }
         button.click()
-        return { ok: true, priorIds }
+        return { ok: true }
       },
       {
-        wantConv: route?.[1] || null,
-        promptText: normPrompt(prompt),
-        selectors: { composer: COMPOSER_SEL, submit: SUBMIT_SEL, messages: MESSAGE_SEL, users: USER_SEL, idAttr: MESSAGE_ID_ATTR },
+        wantConv: route,
+        promptText: canonicalPrompt(prompt),
+        selectors: {
+          composer: COMPOSER_SEL,
+          submit: SUBMIT_SEL,
+          messages: MESSAGE_SEL,
+          chips: ATTACH_CHIP_SEL,
+          attachContainer: ATTACH_CONTAINER_SEL,
+        },
+        expected,
       }
     )
     .catch((e) => ({ error: e.message }))
   if (!result?.ok) {
-    const detail = result?.saw ? ` (composer held: ${JSON.stringify(result.saw)})` : ''
+    const detail = result?.saw ? ` (held: ${JSON.stringify(result.saw)})` : ''
     throw new Error('submission guard: ' + (result?.error || 'unknown result') + detail)
   }
-  return result.priorIds
 }
 
-// The transcript renders user messages as markdown, so DOM innerText can
-// diverge from the authored prompt (list markers, emphasis, blank-line
-// runs). The conversation API returns the authored parts verbatim; all
-// prompt-identity checks go through it. Ids are the same space as DOM
-// data-message-id (mapping key == message.id).
-async function fetchConversationMessages(page, cid) {
-  return page
-    .evaluate(async (cid) => {
-      const s = await (await fetch('/api/auth/session', { credentials: 'include' })).json()
-      if (!s || !s.accessToken) return { error: 'no access token' }
-      const r = await fetch('/backend-api/conversation/' + cid, {
-        headers: { Authorization: 'Bearer ' + s.accessToken },
-        credentials: 'include',
-      })
-      if (!r.ok) return { error: 'conversation fetch ' + r.status }
-      const j = await r.json()
-      const out = []
-      for (const k of Object.keys(j.mapping || {})) {
-        const m = j.mapping[k].message
-        if (!m || !m.content) continue
-        const role = m.author && m.author.role
-        if (role !== 'user' && role !== 'assistant') continue
-        const parts = (m.content.parts || [])
-          .map((p) => (typeof p === 'string' ? p : p && p.text ? p.text : ''))
-          .filter(Boolean)
-        const text = parts.join('\n')
-        if (!text.trim()) continue
-        out.push({ id: m.id || k, role, create: m.create_time || 0, text, status: m.status || null })
-      }
-      out.sort((a, b) => a.create - b.create)
-      return { msgs: out }
-    }, cid)
-    .catch((e) => ({ error: e.message }))
-}
-
-async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineMs) {
-  const deadline = Date.now() + deadlineMs
-  const cid = convIdOf(boundUrl || page.url())
-  if (!cid) throw new Error('no conversation id to verify the accepted prompt against')
-  while (Date.now() < deadline) {
-    if (boundUrl && convIdOf(page.url()) !== convIdOf(boundUrl)) {
-      await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
-      await sleep(jitter(1500, 3000))
-    }
-    const got = await fetchConversationMessages(page, cid)
-    if (got && got.msgs) {
-      // Newest match wins: on the 2026-10 UI the DOM priorIds snapshot is
-      // always empty (no data-message-id nodes), so an oldest-first scan
-      // would re-accept an earlier identical prompt (the agent-mode
-      // "deliver the report" recovery sends repeat verbatim).
-      const hit = [...got.msgs]
-        .reverse()
-        .find(
-          (m) => m.role === 'user' && normStoredPrompt(m.text) === normPrompt(prompt) && !(priorIds || []).includes(m.id)
-        )
-      if (hit) return hit.id
-    }
-    await sleep(jitter(1500, 2500))
+// fetchConversationMessages reads the conversation through the page's
+// authenticated API and returns a conversationSnapshot: ordered branch with
+// channel/end_turn info, plus allUserIds for acceptance baselines. This is
+// the API-first source of truth (the DOM renders markdown and, since the
+// 2026-10 UI, no message ids at all).
+async function fetchConversationMessages(page, cid, timeoutMs = 15000) {
+  const id = conversationId(cid)
+  const response = await getBackendJSON(page, '/backend-api/conversation/' + id, timeoutMs)
+  if (!response.ok) {
+    const error = new AuditError('CONVERSATION_HTTP', `conversation GET failed (${response.status}): ${response.error}`)
+    error.httpStatus = response.status
+    throw error
   }
-  throw new Error('the submitted prompt was not observed as a new user message — refusing to wait on or record a reply')
+  return conversationSnapshot(response.data)
 }
 
-// readComposerAttachments is the DOM adapter: chips scoped to the
-// composer's own container, each with an explicit state. A container with
-// no chips reports zero attachments (known); an unrecognized layout
-// refuses. Transcript text and toasts are never attachment state.
+// waitForAcceptedPrompt proves the submission landed: a NEW user message
+// (id outside the API baseline captured before the click) whose authored
+// text is exactly the prompt. Transient server errors retry; drift off the
+// bound conversation is fatal, not something to navigate back from.
+async function waitForAcceptedPrompt(page, prompt, priorIds, boundUrl, deadlineMs) {
+  const url = conversationUrl(boundUrl)
+  const cid = conversationId(url)
+  const baseline = priorIds instanceof Set ? priorIds : new Set(priorIds || [])
+  const deadline = Date.now() + deadlineMs
+  let lastError = null
+  while (Date.now() < deadline) {
+    let pageUrl = null
+    try {
+      pageUrl = conversationUrl(page.url())
+    } catch {
+      pageUrl = null
+    }
+    if (pageUrl !== url) {
+      throw new AuditError('CONVERSATION_DRIFT', 'page left the bound conversation (at ' + page.url() + ')')
+    }
+    try {
+      const snapshot = await fetchConversationMessages(page, cid, Math.min(15000, Math.max(1, deadline - Date.now())))
+      const hit = findAcceptedUser(snapshot, { priorUserIds: baseline, prompt })
+      if (hit) return hit.id
+    } catch (e) {
+      if (![404, 500, 502, 503, 504].includes(e.httpStatus)) throw e
+      lastError = e
+    }
+    await sleep(Math.min(1500, Math.max(0, deadline - Date.now())))
+  }
+  throw new AuditError(
+    'ACCEPTANCE_UNKNOWN',
+    'submission may have reached ChatGPT but was not uniquely observed; inspect ' + url +
+      ' before sending again' + (lastError ? ' (' + lastError.message + ')' : '')
+  )
+}
+
+// waitForReply tracks the answer through the conversation API: the last
+// user-facing assistant message after the accepted user message, complete
+// only on finished_successfully + end_turn (a "finished" intermediate
+// message without end_turn is not the answer; there is no text-silence
+// fallback). excludedAssistantIds keeps a retry from "completing" by
+// re-reading a pre-existing answer.
+async function waitForReply(page, acceptedUserId, boundUrl, onPartial, excludedAssistantIds = new Set()) {
+  const url = conversationUrl(boundUrl)
+  const cid = conversationId(url)
+  const deadline = Date.now() + validateRunnerConfig().turnTimeoutMs
+  let previous = ''
+  let lastError = null
+  while (Date.now() < deadline) {
+    assertRunnerLive()
+    let pageUrl = null
+    try {
+      pageUrl = conversationUrl(page.url())
+    } catch {
+      pageUrl = null
+    }
+    if (pageUrl !== url) {
+      throw new AuditError('CONVERSATION_DRIFT', 'page left the bound conversation (at ' + page.url() + ')')
+    }
+    try {
+      const snapshot = await fetchConversationMessages(page, cid, Math.min(15000, Math.max(1, deadline - Date.now())))
+      const result = inspectReply(snapshot, acceptedUserId)
+      if (!excludedAssistantIds.has(result.messageId)) {
+        if (result.text !== previous) {
+          previous = result.text
+          if (onPartial) await onPartial(result.text)
+        }
+        if (result.state === 'done') return result
+      }
+    } catch (e) {
+      if (![404, 500, 502, 503, 504].includes(e.httpStatus)) throw e
+      lastError = e
+    }
+    await sleep(Math.min(1200, Math.max(0, deadline - Date.now())))
+  }
+  throw new AuditError(
+    'REPLY_TIMEOUT',
+    'no verified terminal answer before the reply deadline (' +
+      validateRunnerConfig().turnTimeoutMs / 1000 + 's; raise CHATGPT_WEB_TIMEOUT)' +
+      (lastError ? ': ' + lastError.message : '')
+  )
+}
+
+// readComposerAttachments is the DOM adapter over the composer's
+// attachment slot. Live fixture (2026-10-06, main-chat surface): the
+// composer's FORM scope contains a `ComposerLayoutAttachments-*` container
+// with ZERO element children when no attachments exist — a structural
+// empty-state sentinel (verified empty, not "zero selector matches").
+// A populated slot (or legacy chips in scope) reports cards with an
+// explicit 'unknown' state: state is NEVER guessed from visible text (a
+// file named "failed.log" is a name, not a verdict), duplicate basenames
+// are kept, and attachmentVerdict refuses what cannot be proven.
 async function readComposerAttachments(page) {
   return page
-    .evaluate((composerSel) => {
-      const composer = document.querySelector(composerSel)
-      if (!composer) return { known: false }
-      const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement
-      if (!scope) return { known: false }
-      const chips = Array.from(
-        scope.querySelectorAll(
-          '[data-testid*="attach" i], [data-testid*="file" i], [class*="attachment" i], [class*="file-tile" i]'
+    .evaluate(
+      ({ composerSel, selectors }) => {
+        const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden'
+        const composers = [...document.querySelectorAll(composerSel)].filter(visible)
+        if (composers.length !== 1) return { known: false }
+        const composer = composers[0]
+        const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement
+        if (!scope) return { known: false }
+        const container = scope.querySelector(selectors.attachContainer)
+        if (container) {
+          if (container.childElementCount === 0) return { known: true, files: [] }
+          // Cards exist; report their readable names with unknown state.
+          const names = [...container.children].map((card) => {
+            const chip = card.matches(selectors.chips) ? card : card.querySelector(selectors.chips)
+            return ((chip ? chip.innerText : card.innerText) || '').trim().split('\n')[0]?.trim() || null
+          })
+          return { known: true, files: names.map((name) => ({ name, state: 'unknown' })) }
+        }
+        // No sentinel on this layout: fall back to candidate chips in the
+        // composer scope (presence is evidence; emptiness here is only
+        // "no chips matched", the documented residual).
+        const chips = Array.from(scope.querySelectorAll(selectors.chips)).filter(
+          (el) => el.closest('[data-message-author-role]') === null
         )
-      ).filter((el) => el.closest('[data-message-author-role]') === null)
-      const files = []
-      const seen = new Set()
-      for (const chip of chips) {
-        const name = (chip.innerText || '').trim().split('\n')[0]?.trim() || ''
-        const text = (chip.innerText || '').toLowerCase()
-        if (!name || seen.has(name)) continue
-        seen.add(name)
-        let state = 'ready'
-        if (/error|failed/.test(text)) state = 'error'
-        else if (/uploading/.test(text) || /\b\d+\s*%\b/.test(text)) state = 'uploading'
-        files.push({ name, state })
+        const names = chips.map((chip) => (chip.innerText || '').trim().split('\n')[0]?.trim() || null)
+        return { known: true, files: names.map((name) => ({ name, state: 'unknown' })) }
+      },
+      {
+        composerSel: COMPOSER_SEL,
+        selectors: { chips: ATTACH_CHIP_SEL, attachContainer: ATTACH_CONTAINER_SEL },
       }
-      return { known: true, files }
-    }, COMPOSER_SEL)
+    )
     .catch(() => ({ known: false }))
 }
 
@@ -690,45 +809,62 @@ async function waitForAttachments(page, names, timeoutMs) {
     }
     await sleep(jitter(600, 1300))
   }
-  throw new Error(`attachments not ready after ${timeoutMs}ms: ${lastError}`)
+  throw new Error(
+    `attachments not ready after ${timeoutMs}ms: ${lastError}` +
+      (/state unrecognized/.test(lastError)
+        ? ' — the attachment card markup has no verified state profile on this UI (UPLOAD_UNSUPPORTED_UI until remapped)'
+        : '')
+  )
 }
 
+// Chooser-opening retries are separated from upload completion: once files
+// are selected, a readiness timeout is NOT permission to pick them again
+// (re-selecting creates duplicate attachments). The wait runs once.
 async function uploadFiles(page, paths) {
-  const names = paths.map((p) => path.basename(p))
-  let lastErr = null
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const fcP = page.waitForEvent('filechooser', { timeout: 12000 })
-    fcP.catch(() => {})
+  const checked = validateUploads(paths)
+  const names = checked.map((p) => path.basename(p))
+  let chooser = null
+  let lastError = null
+  for (let attempt = 0; attempt < 3 && !chooser; attempt++) {
     try {
+      // Open the menu first; only wait for the chooser once its trigger is
+      // being clicked. The popover sometimes fails to open or renders
+      // without the upload option — a failed attempt retries with a fresh
+      // plus-click.
       await page.locator('[data-testid="composer-plus-btn"]').click({ timeout: 30000, force: true })
-      await sleep(jitter(600, 1200))
-      // The popover sometimes fails to open or renders without the upload
-      // option; a failed attempt is retried with a fresh plus-click.
-      await page.getByText(/upload from computer/i).first().click({ timeout: 15000, force: true })
-      const fc = await fcP
-      await fc.setFiles(paths.map((p) => path.resolve(p)))
-      await waitForAttachments(page, names, 45000)
-      return
+      const upload = page.getByText(/upload from computer/i).first()
+      await upload.waitFor({ state: 'visible', timeout: 15000 })
+      const fcP = page.waitForEvent('filechooser', { timeout: 12000 })
+      fcP.catch(() => {})
+      try {
+        await upload.click({ timeout: 15000, force: true })
+        chooser = await fcP
+      } catch (e) {
+        lastError = e
+        await fcP.catch(() => {})
+      }
     } catch (e) {
-      lastErr = e
-      await fcP.catch(() => {})
+      lastError = e
     }
-    await sleep(jitter(1500, 3000))
+    if (!chooser) await sleep(jitter(1500, 3000))
   }
-  throw lastErr
+  if (!chooser) throw lastError || new Error('file chooser did not open')
+  await chooser.setFiles(checked)
+  await waitForAttachments(page, names, 45000)
 }
 
 // The submit button stays disabled while ChatGPT ingests an attached
-// document. That is a waitable condition, not a failure: poll until the
-// button is enabled so the fail-closed submission guard sees a submittable
-// composer instead of racing file processing.
+// document. That is a waitable condition, not a failure: poll until a
+// unique visible button is enabled so the fail-closed submission guard sees
+// a submittable composer instead of racing file processing.
 async function waitForSubmitEnabled(page, timeoutMs) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const enabled = await page
       .evaluate((sel) => {
-        const b = document.querySelector(sel)
-        return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true'
+        const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden'
+        const buttons = [...document.querySelectorAll(sel)].filter(visible)
+        return buttons.length === 1 && !buttons[0].disabled && buttons[0].getAttribute('aria-disabled') !== 'true'
       }, SUBMIT_SEL)
       .catch(() => false)
     if (enabled) return
@@ -738,67 +874,22 @@ async function waitForSubmitEnabled(page, timeoutMs) {
 }
 
 // The 2026-10 web UI renders transcripts without data-message-author-role
-// or data-message-id, so the old DOM reply tracker is dead. The conversation
-// API is the source of truth: poll it for the first assistant message after
-// the accepted user message, surface growing text as partials, and finish
-// when the backend marks the message finished (with a quiet-period fallback
-// for messages that never expose a terminal status).
-async function waitForReply(page, acceptedUserId, boundUrl, onPartial) {
-  const boundId = convIdOf(boundUrl)
-  if (!boundId) throw new Error('no bound conversation url for reply wait')
-  const started = Date.now()
-  const rebindIfDrifted = async () => {
-    if (convIdOf(page.url()) !== boundId) {
-      await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
-      await sleep(jitter(1500, 3000))
-    }
-  }
-
-  let lastPartial = ''
-  let stable = 0
-  let firstSeen = 0
-  while (Date.now() - started < TURN_TIMEOUT_MS) {
-    await rebindIfDrifted()
-    const got = await fetchConversationMessages(page, boundId)
-    if (got && got.msgs) {
-      const accIdx = got.msgs.findIndex((m) => m.id === acceptedUserId)
-      if (accIdx >= 0) {
-        const reply = got.msgs.slice(accIdx + 1).find((m) => m.role === 'assistant')
-        if (reply && reply.text.trim()) {
-          if (!firstSeen) firstSeen = Date.now()
-          const text = reply.text.trim()
-          if (onPartial && text !== lastPartial) {
-            lastPartial = text
-            await onPartial(text)
-          }
-          if (reply.status === 'finished_successfully') return text
-          if (!reply.status) {
-            stable = text === lastPartial ? stable + 1 : 0
-            if (stable >= 4 && Date.now() - firstSeen > 20000) return text
-          } else {
-            stable = 0
-          }
-        }
-      }
-    }
-    await sleep(jitter(800, 1500))
-  }
-  throw new Error(
-    `response never finished within ${Math.round(TURN_TIMEOUT_MS / 1000)}s (raise CHATGPT_WEB_TIMEOUT)`
-  )
-}
+// or data-message-id, so DOM reply tracking is dead — waitForReply (above)
+// polls the conversation API.
 
 // runResume retries a failed assistant turn in standard ChatGPT: it clicks
 // the conversation's own Retry control (regenerate-thread-error-button) and
-// waits for the regenerated reply. It never clicks "Use Work".
+// waits for the regenerated reply. It never clicks "Use Work". Ownership is
+// authorized BEFORE the click, from the stored accepted user id and the
+// live branch — never from "the text matches some history entry".
 export async function runResume(jobId, turnId) {
   const job = await turns.claim(jobId, turnId, process.pid)
   if (!job) {
     console.error(`turn ${turnId} of job ${jobId} is not admissible (stale, duplicate or terminal) — worker exiting`)
+    process.exitCode = 1
     return
   }
   const tid = job.turnId
-  registerActiveTurn(jobId, tid)
   const fail = async (msg) => {
     await turns.update(jobId, tid, (j) => {
       j.status = 'error'
@@ -807,6 +898,7 @@ export async function runResume(jobId, turnId) {
     notify('chatgpt-web: error', msg)
   }
   try {
+    validateRunnerConfig()
     await ensureBrowser()
     await withPage(async (page) => {
       await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
@@ -817,54 +909,86 @@ export async function runResume(jobId, turnId) {
           'conversation is gated by the ChatGPT Work prompt — the backend insists on Work mode for this thread and standard-mode retry is inert; start a new chat (Work is never auto-clicked)'
         )
       }
+      // Refuse before changing the remote conversation when this surface
+      // has no verified retry control.
       const retry = page.locator('[data-testid="regenerate-thread-error-button"]').first()
       if ((await retry.count().catch(() => 0)) === 0) {
-        throw new Error('no thread error to retry — the conversation is not in a retryable state')
+        throw new AuditError(
+          'RESUME_UNSUPPORTED_UI',
+          'no verified Retry control on this surface (the 2026-10 UI has no mapped retry adapter) — resume is unsupported until remapped'
+        )
       }
+      // Authorization before the click: the retry target must be this
+      // record's stored accepted user id, live on the branch's tip, with
+      // the exact turn prompt.
+      const target = job.resumeTargetUserId
+      if (!target) {
+        throw new AuditError(
+          'RESUME_TARGET_UNKNOWN',
+          'this record has no verified accepted user ID; reconcile manually, do not click Retry'
+        )
+      }
+      const before = await fetchConversationMessages(page, convIdOf(conversationUrl(job.url)))
+      const branchUsers = before.branch.filter((m) => m.role === 'user')
+      const latestUser = branchUsers.length ? branchUsers[branchUsers.length - 1] : null
+      if (!latestUser || latestUser.id !== target || !samePrompt(latestUser.text, job.prompt)) {
+        throw new AuditError('RESUME_NOT_OWNED', "the retry target is not this job's accepted prompt")
+      }
+      // The exclusion set: an existing answer must not "complete" the retry.
+      const previousAssistantIds = new Set(
+        before.branch.filter((m) => m.role === 'assistant').map((m) => m.id)
+      )
       await withLock('send', async () => {
         const s = await updateState((st) => st)
         const L = limits()
         const since = Date.now() - (s.lastSendAt || s.lastTurnEnd || 0)
         const gap = L.minGapMs + Math.random() * 8000
         if (since < gap) await sleep(gap - since)
+        assertOwnedBeforeMutation(jobId, tid)
         await retry.click({ force: true, timeout: 10000 })
         await updateState((st) => {
           st.lastSendAt = Date.now()
         })
       })
-      const got = await fetchConversationMessages(page, convIdOf(job.url))
-      const lastUser = got && got.msgs ? [...got.msgs].reverse().find((m) => m.role === 'user') : null
-      const known = lastUser
-        ? (job.history || []).some((h) => h.role === 'user' && normPrompt(h.text) === normPrompt(lastUser.text))
-        : false
-      if (!lastUser || !known) {
-        throw new Error("cannot resume: the conversation's last user message does not belong to this job")
-      }
-      await turns.update(jobId, tid, (j) => {
-        j.acceptedUserId = lastUser.id
+      await ownedUpdate(jobId, tid, (j) => {
+        j.acceptedUserId = target
+        j.submissionState = 'accepted'
       })
       let lastPartial = 0
-      const reply = await waitForReply(page, lastUser.id, job.url, async (partial) => {
-        if (Date.now() - lastPartial < 2000) return
-        lastPartial = Date.now()
-        await turns.update(jobId, tid, (j) => {
-          j.status = 'streaming'
-          j.reply = partial
-        })
-      })
-      await turns.update(jobId, tid, (j) => {
+      const result = await waitForReply(
+        page,
+        target,
+        job.url,
+        async (partial) => {
+          if (Date.now() - lastPartial < 2000) return
+          lastPartial = Date.now()
+          await ownedUpdate(jobId, tid, (j) => {
+            j.status = 'streaming'
+            j.reply = partial
+          })
+        },
+        previousAssistantIds
+      )
+      const finalSnapshot = await fetchConversationMessages(page, convIdOf(conversationUrl(job.url)))
+      const verified = inspectReply(finalSnapshot, target)
+      if (verified.state !== 'done' || verified.messageId !== result.messageId || verified.text !== result.text) {
+        throw new AuditError('FINAL_CHANGED', 'final answer changed during verification')
+      }
+      await ownedUpdate(jobId, tid, (j) => {
         j.status = 'done'
-        j.reply = reply
+        j.reply = result.text
+        j.replyKind = result.nonText ? 'non-text' : 'text'
+        j.replyContent = result.content ?? null
+        j.assistantMessageId = result.messageId
+        j.submissionState = 'completed'
         j.error = null
-        j.history.push({ role: 'assistant', text: reply })
+        j.history.push({ role: 'assistant', text: result.text, messageId: result.messageId })
       })
       notify('chatgpt-web: done', 'resume completed')
     })
   } catch (e) {
     await fail(String(e.message || e))
     process.exitCode = 1
-  } finally {
-    registerActiveTurn(null, null)
   }
 }
 
@@ -883,11 +1007,13 @@ export async function runTurn(jobId, turnId) {
   const job = await turns.claim(jobId, turnId, process.pid)
   if (!job) {
     console.error(`turn ${turnId} of job ${jobId} is not admissible (stale, duplicate or terminal) — worker exiting`)
+    process.exitCode = 1
     return
   }
   const tid = job.turnId
-  registerActiveTurn(jobId, tid)
   const fail = async (msg) => {
+    // Failure reporting stays a plain (conditional) update: a stale worker
+    // must still be able to file its own failure without owning the record.
     await turns.update(jobId, tid, (j) => {
       j.status = 'error'
       j.error = msg
@@ -895,6 +1021,7 @@ export async function runTurn(jobId, turnId) {
     notify('chatgpt-web: error', msg)
   }
   try {
+    validateRunnerConfig()
     await ensureBrowser()
     await withPage(async (page) => {
       await page.goto(job.url || CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
@@ -902,7 +1029,7 @@ export async function runTurn(jobId, turnId) {
 
       let boundUrl = job.url || null
       let acceptedUserId = null
-      let priorUserIds = []
+      let priorUserIds = new Set()
 
       await withLock('send', async () => {
         const s = await updateState((st) => st)
@@ -935,17 +1062,35 @@ export async function runTurn(jobId, turnId) {
           throw new Error('the tab left the fresh chat during preparation — refusing to type into ' + page.url())
         }
 
+        // API acceptance baseline for an existing conversation: every user
+        // message id present BEFORE the click. The acceptance check matches
+        // a NEW id against authored text — the DOM-id baseline was always
+        // empty on the 2026-10 UI, so a repeated verbatim prompt could be
+        // "accepted" by an older identical message.
+        priorUserIds = job.url
+          ? (await fetchConversationMessages(page, convIdOf(conversationUrl(job.url)))).allUserIds
+          : new Set()
+        await ownedUpdate(jobId, tid, (j) => {
+          j.priorUserIds = [...priorUserIds]
+          j.submissionState = 'prepared'
+        })
+
         // The 2026-10 UI syncs a server-side draft into the composer that
-        // can land AFTER typing and clobber the prompt. Retry the type when
-        // the guard sees the composer diverge; any other guard failure is
-        // real and fails the turn.
+        // can land AFTER typing and clobber the prompt. Retyping is
+        // permitted only for a PRE-CLICK composer mismatch reported by the
+        // guard; a transport/evaluation error after a possible click is a
+        // terminal ACCEPTANCE_UNKNOWN, never permission to click again.
+        await ownedUpdate(jobId, tid, (j) => {
+          j.submissionState = 'dispatching'
+        })
         let submitErr = null
         for (let attempt = 0; attempt < 3; attempt++) {
+          assertOwnedBeforeMutation(jobId, tid)
           await typePrompt(page, composer, job.prompt)
           await sleep(attempt === 0 ? 900 : jitter(1400, 2600))
           if (job.files && job.files.length) await waitForSubmitEnabled(page, 150000)
           try {
-            priorUserIds = await sendPromptGuarded(page, { boundUrl: job.url, prompt: job.prompt })
+            await sendPromptGuarded(page, { boundUrl: job.url, prompt: job.prompt, files: job.files || [] })
             submitErr = null
             break
           } catch (e) {
@@ -957,6 +1102,9 @@ export async function runTurn(jobId, turnId) {
         await updateState((st) => {
           st.lastSendAt = Date.now()
         })
+        await ownedUpdate(jobId, tid, (j) => {
+          j.submissionState = 'dispatched'
+        })
       })
 
       if (!boundUrl) {
@@ -967,7 +1115,7 @@ export async function runTurn(jobId, turnId) {
           const id = convIdOf(page.url())
           if (id) {
             boundUrl = page.url()
-            await turns.update(jobId, tid, (j) => {
+            await ownedUpdate(jobId, tid, (j) => {
               j.url = boundUrl
             })
             break
@@ -980,71 +1128,74 @@ export async function runTurn(jobId, turnId) {
       // The accepted user message is the identity every later check hangs
       // on: partial publication, the final reply, and their association.
       acceptedUserId = await waitForAcceptedPrompt(page, job.prompt, priorUserIds, boundUrl, 60000)
-      await turns.update(jobId, tid, (j) => {
+      await ownedUpdate(jobId, tid, (j) => {
         j.acceptedUserId = acceptedUserId
+        j.submissionState = 'accepted'
       })
 
       let lastPartial = 0
-      const reply = await waitForReply(page, acceptedUserId, boundUrl, async (partial) => {
+      const result = await waitForReply(page, acceptedUserId, boundUrl, async (partial) => {
         if (Date.now() - lastPartial < 2000) return
         lastPartial = Date.now()
-        await turns.update(jobId, tid, (j) => {
+        await ownedUpdate(jobId, tid, (j) => {
           j.status = 'streaming'
           j.reply = partial
         })
       })
 
-      if (convIdOf(page.url()) !== convIdOf(boundUrl)) {
-        await page.goto(boundUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
-        await sleep(jitter(1500, 3000))
-      }
-      // Final verification: the accepted turn still says exactly this
-      // prompt (via the API; the DOM renders markdown, not authored text).
-      const fin = await fetchConversationMessages(page, convIdOf(boundUrl))
-      const lastUser = fin && fin.msgs ? [...fin.msgs].reverse().find((m) => m.role === 'user') : null
-      if (!lastUser || lastUser.id !== acceptedUserId || normStoredPrompt(lastUser.text) !== normPrompt(job.prompt)) {
-        throw new Error("final verification failed: the conversation's last user message is not this turn's prompt")
+      // Final verification against a fresh snapshot: the answer this turn
+      // publishes is the answer that is on the record.
+      const finalSnapshot = await fetchConversationMessages(page, convIdOf(conversationUrl(boundUrl)))
+      const verified = inspectReply(finalSnapshot, acceptedUserId)
+      if (verified.state !== 'done' || verified.messageId !== result.messageId || verified.text !== result.text) {
+        throw new AuditError('FINAL_CHANGED', 'final answer changed during verification')
       }
 
-      await turns.update(jobId, tid, (j) => {
+      await ownedUpdate(jobId, tid, (j) => {
         j.status = 'done'
-        j.reply = reply
-        j.url = boundUrl
+        j.reply = result.text
+        j.replyKind = result.nonText ? 'non-text' : 'text'
+        j.replyContent = result.content ?? null
+        j.assistantMessageId = result.messageId
+        j.submissionState = 'completed'
         j.error = null
-        j.history.push({ role: 'assistant', text: reply })
+        j.history.push({ role: 'assistant', text: result.text, messageId: result.messageId })
       })
-      notify('chatgpt-web: done', reply.slice(0, 90))
+      notify('chatgpt-web: done', result.text.slice(0, 90))
     })
   } catch (e) {
     let msg = String(e && e.message ? e.message : e)
     if (/singleton/i.test(msg)) msg = 'profile is in use — quit the chatgpt-web Chrome window first'
     await fail(msg)
+    process.exitCode = 1
   } finally {
     await updateState((st) => {
       st.lastTurnEnd = Date.now()
     })
-    registerActiveTurn(null, null)
   }
 }
 
 export async function runLogin() {
-  await ensureBrowser()
-  setDaemonVisible(true)
-  console.error('chatgpt-web Chrome is open — log in to ChatGPT in its window. Waiting up to 5 minutes...')
+  // The unhide runs INSIDE the withPage callback, after its browser ensure —
+  // an outer call raced withPage's own ensureBrowser hide sweeps (and any
+  // concurrent command's), fighting the login window. withPage also holds
+  // the browser-visibility lock exclusively for the whole login, so no
+  // other command's hide timer can intervene.
   await withPage(
     async (page) => {
+      setDaemonVisible(true)
+      console.error('Chrome is open for login; waiting up to five minutes')
       await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
       const deadline = Date.now() + 300000
-      for (;;) {
-        const state = await classifyPage(page)
-        if (state === 'in') return true
-        if (Date.now() > deadline) throw new Error('timed out waiting for login (5 min)')
+      while (Date.now() < deadline) {
+        if ((await classifyPage(page)) === 'in') return
         await sleep(1500)
       }
+      throw new Error('timed out waiting for login')
     },
     { keepVisible: true }
   )
-  console.error('verified: logged in.')
+  console.error('verified: logged in')
 }
 
 export async function runChats(opts = {}) {
@@ -1100,37 +1251,62 @@ export async function runChats(opts = {}) {
       return
     }
     if (deleteIds || deleteAll) {
-      const known = new Set(outcome.items.map((it) => String(it.id || '')))
-      const wanted = deleteAll ? [...known] : deleteIds
-      const unknown = wanted.filter((id) => !known.has(id))
-      if (unknown.length) {
-        console.error('not in visible chat list (cap 200): ' + unknown.join(', '))
+      // Destructive deletes need a complete frozen inventory: refuse on any
+      // listing error or cap, on unknown ids, and on conversations with
+      // running turns — never delete a partial set after reporting an
+      // inventory error.
+      const activeIds = runningJobs().map((j) => convIdOf(j.url)).filter(Boolean)
+      const plan = planDeletion({
+        items: outcome.items,
+        listingError: outcome.error,
+        hitCap: !!result.hitCap,
+        deleteIds,
+        deleteAll,
+        confirmed: opts.yes === true,
+        activeIds,
+      })
+      if (plan.error) {
+        console.error('refusing to delete: ' + plan.error)
         process.exitCode = 1
+        return
       }
-      const targets = wanted.filter((id) => known.has(id))
-      if (!targets.length) return
-      // Soft-delete via the same endpoint the sidebar uses: is_visible=false
-      // moves the thread to Deleted chats (30-day recovery). The old
-      // `PATCH /backend-api/conversation?id=` form started returning 405
-      // (verified 2026-09-17); the path-parameter form is the current one.
-      const del = await page.evaluate(async (ids) => {
-        const session = await fetch('/api/auth/session', { credentials: 'include' }).then((r) => r.json())
-        const token = session && session.accessToken
-        if (!token) return { error: 'no session token' }
-        const headers = { Authorization: 'Bearer ' + token, Accept: 'application/json', 'Content-Type': 'application/json' }
-        const results = []
-        for (const id of ids) {
-          const r = await fetch('/backend-api/conversation/' + id, {
-            method: 'PATCH',
-            credentials: 'include',
-            headers,
-            body: JSON.stringify({ is_visible: false }),
-          })
-          results.push({ id, ok: r.ok, http: r.status })
-          await new Promise((res) => setTimeout(res, 400))
+      if (!plan.targets.length) {
+        console.log(plan.note || 'nothing to delete')
+        return
+      }
+      console.log(`deleting ${plan.targets.length} conversation(s)…`)
+      // Targets are frozen; the active-turn revalidation and the PATCHes
+      // run under the same store lock admissions use, so no turn can be
+      // admitted against a conversation being deleted.
+      let del = null
+      await withStoreLock(async () => {
+        const live = runningJobs().map((j) => convIdOf(j.url)).filter(Boolean)
+        const clash = plan.targets.filter((id) => live.includes(id))
+        if (clash.length) {
+          throw new Error('refusing to delete conversations with running turns: ' + clash.join(', '))
         }
-        return { results }
-      }, targets)
+        // Soft-delete via the same endpoint the sidebar uses:
+        // is_visible=false hides the thread from the sidebar. Recovery
+        // terms are the service's to define — check its UI.
+        del = await page.evaluate(async (ids) => {
+          const session = await fetch('/api/auth/session', { credentials: 'include' }).then((r) => r.json())
+          const token = session && session.accessToken
+          if (!token) return { error: 'no session token' }
+          const headers = { Authorization: 'Bearer ' + token, Accept: 'application/json', 'Content-Type': 'application/json' }
+          const results = []
+          for (const id of ids) {
+            const r = await fetch('/backend-api/conversation/' + id, {
+              method: 'PATCH',
+              credentials: 'include',
+              headers,
+              body: JSON.stringify({ is_visible: false }),
+            })
+            results.push({ id, ok: r.ok, http: r.status })
+            await new Promise((res) => setTimeout(res, 400))
+          }
+          return { results }
+        }, plan.targets)
+      })
       if (del.error) {
         console.error('delete failed: ' + del.error)
         process.exitCode = 1
@@ -1140,7 +1316,9 @@ export async function runChats(opts = {}) {
       for (const r of del.results) {
         if (!r.ok) console.error('delete failed: ' + r.id + ' http ' + r.http)
       }
-      console.log('deleted ' + ok + '/' + del.results.length + ' chats (recoverable 30 days in Settings > Deleted chats)')
+      console.log(
+        `deleted ${ok}/${del.results.length} chats (hidden from the sidebar — check the service UI, e.g. Settings > Deleted chats, for available recovery)`
+      )
       if (ok < del.results.length) process.exitCode = 1
       return
     }
@@ -1229,13 +1407,24 @@ async function captureChatFiles(page, chatId) {
   return out
 }
 
+// Bounded transfers: an intercepted artifact body rejects an excessive
+// declared Content-Length before allocation (a chunked/no-length body
+// cannot be pre-bounded — the streaming path below covers re-fetches); a
+// descriptor download goes through boundedBrowserDownload (exact origins,
+// no redirects, hard byte cap, compact base64 transfer instead of a
+// per-byte numeric array).
 async function fileBytes(page, resp, { kind = 'artifact' } = {}) {
-  const bytes = Buffer.from(await resp.body())
-  if (kind === 'artifact') return bytes // JSON is valid file content, too.
+  if (kind === 'artifact') {
+    const declared = Number(resp.headers()['content-length']) || 0
+    if (declared > ARTIFACT_MAX_BYTES) {
+      throw new Error(`artifact exceeds the transfer cap (${declared} > ${ARTIFACT_MAX_BYTES} bytes)`)
+    }
+    return Buffer.from(await resp.body()) // JSON is valid file content, too.
+  }
   if (kind !== 'descriptor') throw new Error('unknown file response kind')
   let descriptor
   try {
-    descriptor = JSON.parse(bytes.toString('utf8'))
+    descriptor = JSON.parse((await resp.body()).toString('utf8'))
   } catch {
     throw new Error('file descriptor is not valid JSON')
   }
@@ -1243,13 +1432,7 @@ async function fileBytes(page, resp, { kind = 'artifact' } = {}) {
     throw new Error('file descriptor has no download_url')
   }
   const url = new URL(descriptor.download_url, resp.url())
-  if (url.protocol !== 'https:' || url.username || url.password) throw new Error('invalid artifact URL')
-  const values = await page.evaluate(async (href) => {
-    const response = await fetch(href, { credentials: 'same-origin', signal: AbortSignal.timeout(30000) })
-    if (!response.ok) throw new Error('download http ' + response.status)
-    return Array.from(new Uint8Array(await response.arrayBuffer()))
-  }, url.href)
-  return Buffer.from(values)
+  return boundedBrowserDownload(page, url.href)
 }
 
 async function manifestFor(page, chatId) {
@@ -1337,19 +1520,11 @@ async function modelButton(page) {
   return page.locator('[data-cgw-model-btn="1"]').first()
 }
 
-// parseSliderDesc reads the Power slider's value out of its
-// aria-describedby text. The row exposes no aria-valuenow; the current stop
-// is only in the described text: "Pro, 5 of 5. Use Left and Right arrow
-// keys to adjust power".
-export function parseSliderDesc(text) {
-  const m = String(text || '').match(/^(.+?),\s*(\d+)\s+of\s+(\d+)\b/)
-  if (!m) return null
-  const n = Number(m[2])
-  const total = Number(m[3])
-  if (!n || !total || n > total) return null
-  return { name: normText(m[1]), n, total }
-}
-
+// parseSliderDescription (audit-core) reads the Power slider's value out of
+// its aria-describedby text. The row exposes no aria-valuenow; the current
+// stop is only in the described text: "Pro, 5 of 5. Use Left and Right arrow
+// keys to adjust power". It rejects non-safe integers and unreasonable
+// bounds outright.
 function describePick(p) {
   return p.kind === 'model' ? p.label : p.label + ' (' + p.n + ' of ' + p.total + ')'
 }
@@ -1444,8 +1619,22 @@ async function readSliderState(page) {
     })
     .catch(() => null)
   if (!raw) return null
-  const parsed = parseSliderDesc(raw.descText)
+  const parsed = parseSliderDescription(raw.descText)
   return parsed ? { ...parsed, effective: raw.effective } : null
+}
+
+// checkedRadioLabel reads the currently selected named model from the open
+// menu (used to snapshot/verify the full picker state).
+async function checkedRadioLabel(page) {
+  return page
+    .evaluate(() => {
+      const radios = Array.from(document.querySelectorAll('[role="menuitemradio"]'))
+      const hit = radios.find(
+        (e) => e.getAttribute('data-state') === 'checked' || e.getAttribute('aria-checked') === 'true'
+      )
+      return hit ? (hit.innerText || '').replace(/\s+/g, ' ').trim() : null
+    })
+    .catch(() => null)
 }
 
 // focusSlider is kept only as a belt-and-braces aid: synthetic key events
@@ -1491,18 +1680,19 @@ async function stepSlider(page, dir) {
 
 // settleSliderReads waits out the slider's animation lag: the described
 // position can keep drifting after the last key event landed, so a single
-// read is stale. Two consecutive reads agreeing is "settled".
+// read is stale. Two consecutive reads agreeing on the FULL state (name,
+// position, total, effective label) is "settled"; a number agreeing across
+// two reads does not prove the label settled. Unsettled throws.
 async function settleSliderReads(page, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs
-  let last = null
-  let cur = null
+  let previous = null
   while (Date.now() < deadline) {
-    cur = await readSliderState(page)
-    if (cur && last && cur.n === last.n) return cur
-    last = cur
-    await sleep(700)
+    const current = await readSliderState(page)
+    if (sliderEqual(previous, current)) return current
+    previous = current
+    await sleep(Math.min(700, Math.max(0, deadline - Date.now())))
   }
-  return cur
+  throw new AuditError('SLIDER_NOT_SETTLED', 'power state did not settle')
 }
 
 // moveSliderTo presses toward targetN until a SETTLED read agrees. Any
@@ -1522,30 +1712,54 @@ async function moveSliderTo(page, targetN, total) {
 
 // enumerateSliderStops walks the slider left to stop 1, right to its last
 // stop, and back to where it started, recording every stop's name and
-// effective label. The restore is settle-verified — a list command must not
-// leave the account default moved.
+// effective label. The walk runs inside withRestoredPicker: the snapshot
+// covers BOTH the checked named model and the full slider state, and a
+// restoration failure is always reported (a list command must not leave the
+// account default moved). Every position 1..total must have been observed —
+// a partial menu is never reported as exhaustive.
 async function enumerateSliderStops(page) {
-  const initial = await readSliderState(page)
-  if (!initial) throw new Error('power slider not present in the open model menu')
-  const total = initial.total
-  const stops = new Map()
-  const record = (s) => {
-    if (s) stops.set(s.n, { n: s.n, name: s.name, effective: s.effective, total: s.total })
-    return s
-  }
-  record(initial)
-  await focusSlider(page)
-  let cur = initial
-  let guard = 2 * total + 2
-  while (cur && cur.n > 1 && guard-- > 0) cur = record(await stepSlider(page, 'ArrowLeft'))
-  guard = 2 * total + 2
-  while (cur && cur.n < total && guard-- > 0) cur = record(await stepSlider(page, 'ArrowRight'))
-  const restored = await moveSliderTo(page, initial.n, total)
-  if (restored) record(restored)
-  if (!restored || restored.n !== initial.n) {
-    throw new Error(`power slider could not be restored to ${initial.n} of ${total} (at ${restored ? restored.n : '?'}) — check the picker manually`)
-  }
-  return { stops: [...stops.values()].sort((a, b) => a.n - b.n), final: restored }
+  return withRestoredPicker({
+    snapshot: async () => ({
+      slider: await readSliderState(page),
+      modelLabel: await checkedRadioLabel(page),
+    }),
+    restore: async (original) => {
+      let ok = true
+      if (original.slider) {
+        const back = await moveSliderTo(page, original.slider.n, original.slider.total)
+        if (!back || back.n !== original.slider.n) ok = false
+      }
+      if (ok && original.modelLabel && original.modelLabel !== (await checkedRadioLabel(page))) {
+        ok = false // the named selection moved unexpectedly — report it
+      }
+      return ok
+    },
+    body: async (original) => {
+      const initial = original.slider
+      if (!initial) throw new Error('power slider not present in the open model menu')
+      const total = initial.total
+      const stops = new Map()
+      const record = (s) => {
+        if (s) stops.set(s.n, { n: s.n, name: s.name, effective: s.effective, total: s.total })
+        return s
+      }
+      record(initial)
+      await focusSlider(page)
+      let cur = initial
+      let guard = 2 * total + 2
+      while (cur && cur.n > 1 && guard-- > 0) cur = record(await stepSlider(page, 'ArrowLeft'))
+      guard = 2 * total + 2
+      while (cur && cur.n < total && guard-- > 0) cur = record(await stepSlider(page, 'ArrowRight'))
+      for (let n = 1; n <= total; n++) {
+        if (!stops.has(n)) {
+          throw new AuditError('SLIDER_ENUM_INCOMPLETE', `enumeration missed stop ${n} of ${total} — partial menus are not reported as exhaustive`)
+        }
+      }
+      const restored = await moveSliderTo(page, initial.n, total)
+      if (restored) record(restored)
+      return { stops: [...stops.values()].sort((a, b) => a.n - b.n), final: restored || initial }
+    },
+  })
 }
 
 // applySliderStop moves the slider to targetN with arrow presses and
@@ -1651,89 +1865,146 @@ async function applyModelSelection(page, btn, open, label) {
 // "6 Pro" stop the UI exposes). The slider is an account-wide default —
 // once set here, every later composer (including runner-started fresh
 // chats) inherits it, so `start`/`send` need no model work of their own.
+//
+// The whole operation runs under the send lock (taken BEFORE the page is
+// created — a cached composer can carry stale picker state), so a model
+// change never reorders against a live send/dot-send/retry. A plain
+// listing never walks the slider: the walk temporarily moves the
+// account-wide default, so stop names are discovered only for an explicit
+// set.
 export async function runModel(want) {
-  await withPage(async (page) => {
-    await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
-    await waitForComposer(page)
-    const btn = await modelButton(page)
-    if (!btn || (await btn.count().catch(() => 0)) === 0) {
-      throw new Error('model picker not found — the web UI changed; update modelButton in runner.mjs')
-    }
-    if (!(await openPickerMenu(page, btn))) {
-      throw new Error('model menu did not open — the web UI changed; update openPickerMenu in runner.mjs')
-    }
-    // openModelMenu is idempotent (sees the open menu) and knows the radio
-    // view-toggle fallback from the 2026-10 simple view.
-    const menu = await openModelMenu(page, btn)
-    const modelLabels = menu ? menu.labels.filter(Boolean) : []
-    let slider = await readSliderState(page)
-    if (!modelLabels.length && !slider) {
-      await page.keyboard.press('Escape').catch(() => {})
-      throw new Error('model menu opened but listed no models and no power slider — the web UI changed')
-    }
-
-    // Stop names exist only on the live control; enumeration walks the
-    // slider and restores the starting position (verified inside).
-    let stops = null
-    if (slider) {
-      const walk = await enumerateSliderStops(page)
-      stops = walk.stops
-      slider = walk.final
-    }
-
-    const closeMenu = () => page.keyboard.press('Escape').catch(() => {})
-    if (!want) {
-      modelLabels.forEach((l, i) => console.log((menu && i === menu.checked ? '* ' : '  ') + l))
-      if (stops) {
-        console.log('')
-        console.log('slider (thinking power):')
-        for (const s of stops) {
-          const mark = s.n === slider.n ? '* ' : '  '
-          const eff = s.effective && s.effective !== s.name ? `  (${s.effective})` : ''
-          console.log(`${mark}${s.n}  ${s.name}${eff}`)
-        }
+  await withLock('send', async () => {
+    await withPage(async (page) => {
+      await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      await waitForComposer(page)
+      const btn = await modelButton(page)
+      if (!btn || (await btn.count().catch(() => 0)) === 0) {
+        throw new Error('model picker not found — the web UI changed; update modelButton in runner.mjs')
       }
-      await closeMenu()
-      return
-    }
-
-    const pick = pickPickerMatch(modelLabels, stops || [], want)
-    if (pick.error) {
-      console.error(pick.error)
-      if (!pick.error.includes('matches ')) {
-        modelLabels.forEach((l) => console.error('  ' + l))
-        if (stops) {
-          console.error('  slider (thinking power):')
-          for (const s of stops) console.error(`  ${s.n}  ${s.name}${s.effective && s.effective !== s.name ? '  (' + s.effective + ')' : ''}`)
-        }
+      if (!(await openPickerMenu(page, btn))) {
+        throw new Error('model menu did not open — the web UI changed; update openPickerMenu in runner.mjs')
       }
-      await closeMenu()
-      process.exitCode = 1
-      return
-    }
+      // openModelMenu is idempotent (sees the open menu) and knows the radio
+      // view-toggle fallback from the 2026-10 simple view.
+      const menu = await openModelMenu(page, btn)
+      const modelLabels = menu ? menu.labels.filter(Boolean) : []
+      let slider = await readSliderState(page)
+      if (!modelLabels.length && !slider) {
+        await page.keyboard.press('Escape').catch(() => {})
+        throw new Error('model menu opened but listed no models and no power slider — the web UI changed')
+      }
 
-    if (pick.kind === 'model') {
-      const applied = await applyModelSelection(page, btn, menu, pick.label)
-      if (!applied) {
-        console.error(`could not confirm "${pick.label}" was selected — check the picker manually`)
+      let stops = slider ? [slider] : []
+      if (slider && want) {
+        const walk = await enumerateSliderStops(page)
+        stops = walk.stops
+        slider = walk.final
+      }
+
+      const closeMenu = () => page.keyboard.press('Escape').catch(() => {})
+      if (!want) {
+        // Mark against the ORIGINAL radio index: menu.checked indexes the
+        // unfiltered radio list, modelLabels is filtered — a filtered index
+        // marks the wrong row whenever a label came back empty.
+        menu?.labels.forEach((label, originalIndex) => {
+          if (label) console.log((originalIndex === menu.checked ? '* ' : '  ') + label)
+        })
+        if (slider) {
+          console.log('')
+          console.log('slider (thinking power):')
+          const s = stops.find((x) => x.n === slider.n && x.total === slider.total) || slider
+          console.log(`* ${s.n}  ${s.name}${s.effective && s.effective !== s.name ? `  (${s.effective})` : ''}`)
+          console.log('  (other stops are listed only when setting one, e.g.: chatgpt-web model 6 pro)')
+        }
+        await closeMenu()
+        return
+      }
+
+      const pick = pickPickerMatch(modelLabels, stops || [], want)
+      if (pick.error) {
+        console.error(pick.error)
+        if (!pick.error.includes('matches ')) {
+          modelLabels.forEach((l) => console.error('  ' + l))
+          if (stops && stops.length) {
+            console.error('  slider (thinking power):')
+            for (const s of stops) {
+              console.error(`  ${s.n}  ${s.name}${s.effective && s.effective !== s.name ? '  (' + s.effective + ')' : ''}`)
+            }
+          }
+        }
+        await closeMenu()
         process.exitCode = 1
         return
       }
-      console.log(`model set: ${pick.label}`)
-      return
-    }
 
-    // Slider stop: the enumeration left the menu open at the original
-    // position; applySliderStop moves, verifies, closes, reopens and
-    // re-verifies.
-    const result = await applySliderStop(page, btn, pick.n, pick.total)
-    if (!result) {
-      console.error(`could not confirm power stop "${pick.label}" (${pick.n} of ${pick.total}) — check the picker manually`)
-      process.exitCode = 1
-      return
-    }
-    const eff = result.effective && result.effective !== pick.label ? ` — effective: ${result.effective}` : ''
-    console.log(`model set: ${pick.label} (${pick.n} of ${pick.total})${eff}`)
+      // A failed explicit selection restores the original complete picker
+      // state (named model + slider) where possible, and always reports a
+      // restoration failure instead of silently leaving a changed default.
+      const originalSlider = slider ? { ...slider } : null
+      const originalModel = menu && typeof menu.checked === 'number' ? menu.labels[menu.checked] || null : null
+      const restoreOriginal = async () => {
+        let ok = true
+        try {
+          if (originalSlider) {
+            if (!(await openPickerMenu(page, btn))) return false
+            const back = await moveSliderTo(page, originalSlider.n, originalSlider.total)
+            if (!back || back.n !== originalSlider.n) ok = false
+          }
+          if (ok && originalModel) {
+            const again = await openModelMenu(page, btn)
+            if (!again || !(await applyModelSelection(page, btn, again, originalModel))) ok = false
+          }
+        } catch {
+          ok = false
+        }
+        return ok
+      }
+      const reportFailure = async (note) => {
+        let message = note
+        try {
+          if (!(await restoreOriginal())) message += '; restoration to the original picker state could not be confirmed — check the picker manually'
+        } catch (e) {
+          message += '; restoration failed: ' + e.message
+        }
+        console.error(message)
+        process.exitCode = 1
+      }
+
+      if (pick.kind === 'model') {
+        let applied = false
+        try {
+          applied = await applyModelSelection(page, btn, menu, pick.label)
+        } catch (e) {
+          await reportFailure(`selecting "${pick.label}" failed: ${e.message}`)
+          return
+        }
+        if (!applied) {
+          await reportFailure(`could not confirm "${pick.label}" was selected — check the picker manually`)
+          return
+        }
+        console.log(`model set: ${pick.label}`)
+        return
+      }
+
+      // Slider stop: the enumeration left the menu open at the original
+      // position; applySliderStop moves, verifies, closes, reopens and
+      // re-verifies.
+      let result = null
+      try {
+        result = await applySliderStop(page, btn, pick.n, pick.total)
+      } catch (e) {
+        await reportFailure(`setting power stop "${pick.label}" (${pick.n} of ${pick.total}) failed: ${e.message}`)
+        return
+      }
+      if (!result) {
+        await reportFailure(
+          `could not confirm power stop "${pick.label}" (${pick.n} of ${pick.total}) — check the picker manually`
+        )
+        return
+      }
+      const eff = result.effective && result.effective !== pick.label ? ` — effective: ${result.effective}` : ''
+      console.log(`model set: ${pick.label} (${pick.n} of ${pick.total})${eff}`)
+    })
   })
 }
 
@@ -1749,11 +2020,17 @@ export async function runModel(want) {
 
 const DOTS_URL = 'https://chatgpt.com/dots'
 const DOT_SUBMIT_SEL = 'button[aria-label="Send" i]'
-const DOT_SELF_ROW_SEL = '.message-row.self'
 const DOT_ROOM_LIST_LIMIT = 20
 // The messaging endpoints 422 above their cap: rooms max 20, messages max 32
 // (both are the page's own request sizes; 422 observed on 50 and 100).
 const DOT_MSG_PAGE_LIMIT = 32
+
+// Every exported dot operation (discovery, status, poll, context, send,
+// reset) runs entirely inside one operation lock, and the binding is
+// re-read AFTER acquiring it — stale reads used to race and could overwrite
+// checkpoints or resurrect a reset record. This is a separate lock, not a
+// recursive acquisition of updateDot's short write lock.
+const withDotOperation = (fn) => withLock('dot-operation', fn)
 
 function dotRouteId(url) {
   const m = String(url || '').match(/\/dots\/([0-9a-fA-F-]{8,})/)
@@ -1784,10 +2061,13 @@ async function authedFetchInPage(page, urlPath) {
 // discoverDotRoom binds the dot: the /dots route redirects to the primary
 // dot's thread (its slug ids the dot), and the rooms list names exactly one
 // DM room per dot. Ambiguity refuses — two dots cannot share one record.
+// Discovery preserves an existing same-room record (its watermark and
+// last-send fields) instead of replacing it, and refuses a changed binding
+// unless it was explicitly reset.
 async function ensureDotRecord() {
   const existing = readDot()
   if (existing && existing.roomId && existing.dotId && existing.myId) return existing
-  return withPage(async (page) => {
+  const record = await withPage(async (page) => {
     await page.goto(DOTS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
     let dotId = null
     const deadline = Date.now() + 25000
@@ -1806,6 +2086,14 @@ async function ensureDotRecord() {
     if (res.error) throw new Error('rooms fetch failed: ' + res.error)
     if (res.status !== 200) throw new Error('rooms fetch http ' + res.status)
     const rooms = (res.body && res.body.items) || []
+    // Complete-inventory rule: a full first page could hide additional
+    // eligible rooms behind pagination — refuse rather than guess.
+    if (rooms.length >= DOT_ROOM_LIST_LIMIT) {
+      throw new AuditError(
+        'DOT_ROOMS_PAGE_FULL',
+        `room listing returned a full page (${rooms.length}) — additional rooms may exist beyond it; refusing to bind from a partial inventory`
+      )
+    }
     const dms = rooms.filter((r) => r.type === 'DM' && r.app_source === 'chatgpt:messaging')
     if (dms.length === 0) throw new Error('no dot messaging room on this account')
     if (dms.length > 1) {
@@ -1817,7 +2105,7 @@ async function ensureDotRecord() {
     const room = dms[0]
     const mine = (room.members || []).find((m) => typeof m.account_user_id === 'string' && m.account_user_id.startsWith('user-'))
     if (!mine) throw new Error('dot room has no human member — refusing to guess authorship')
-    const record = {
+    return {
       roomId: room.id,
       roomName: room.name || 'Dot',
       dotId,
@@ -1828,7 +2116,16 @@ async function ensureDotRecord() {
       lastSentText: null,
       watermark: null,
     }
-    await updateDot(() => record)
+  })
+  return updateDot((cur) => {
+    if (cur && (cur.roomId || cur.dotId)) {
+      if (cur.roomId !== record.roomId || cur.dotId !== record.dotId) {
+        throw new Error(
+          `stored dot binding (${cur.roomId || '?'}) differs from the discovered room (${record.roomId}) — run: chatgpt-web dot --reset to rebind`
+        )
+      }
+      return cur // same room: preserve watermark/last-send checkpoints
+    }
     return record
   })
 }
@@ -1861,21 +2158,9 @@ function renderDotMessage(m) {
   return `[${stamp}] ${who}: ${body}`
 }
 
-// messagesAfter applies the watermark by ID, with created_at only as a
-// coarse floor: the server returns created_at with varying sub-second
-// precision between fetches (observed live), so exact time equality cannot
-// decide membership. Anything whose id is already counted is old; anything
-// unseen but more than 2s before the watermark is an old backfill.
-function messagesAfter(msgs, watermark) {
-  if (!watermark) return msgs
-  return msgs.filter((m) => !watermark.ids.includes(m.id) && m.at >= watermark.t - 2000)
-}
-
-function watermarkAt(msgs) {
-  if (!msgs.length) return null
-  const last = msgs[msgs.length - 1]
-  return { t: last.at, ids: msgs.filter((m) => m.at === last.at).map((m) => m.id) }
-}
+// Watermark semantics live in audit-core (dotPollBatch/afterDotSend):
+// membership by id, created_at only a coarse backfill floor, and v2
+// checkpoints retain delivered ids so a send cannot clobber unread ones.
 
 // withDotReadPage runs reads against a chatgpt.com page for the session
 // origin. Everything happens inside the callback: withPage owns the tab and
@@ -1889,71 +2174,106 @@ async function withDotReadPage(fn) {
 }
 
 export async function runDotStatus() {
-  const dot = await ensureDotRecord()
-  await withDotReadPage(async (page) => {
-    const msgs = await fetchDotMessages(page, dot)
-    const fresh = messagesAfter(msgs, dot.watermark)
-    console.log(`dot room ${dot.roomId} (${dot.roomName})`)
-    console.log(`thread: ${dot.url}`)
-    console.log(`messages on record: ${msgs.length}, new since last poll: ${fresh.length}`)
-    if (dot.lastSentAt) {
-      console.log(`last sent: ${new Date(dot.lastSentAt).toISOString()} — ${String(dot.lastSentText || '').replace(/\s+/g, ' ').slice(0, 60)}`)
-    } else {
-      console.log('last sent: never (this record)')
-    }
-    if (msgs.length) console.log('latest: ' + renderDotMessage(msgs[msgs.length - 1]).slice(0, 120))
-    if (fresh.length) console.log('run: chatgpt-web dot --poll')
+  await withDotOperation(async () => {
+    const dot = await ensureDotRecord()
+    await withDotReadPage(async (page) => {
+      const msgs = await fetchDotMessages(page, dot)
+      const batch = dotPollBatch(msgs, dot.watermark, { limit: DOT_MSG_PAGE_LIMIT })
+      console.log(`dot room ${dot.roomId} (${dot.roomName})`)
+      console.log(`thread: ${dot.url}`)
+      console.log(`messages on record: ${msgs.length}, new since last poll: ${batch.messages.length}`)
+      if (dot.lastSentAt) {
+        console.log(`last sent: ${new Date(dot.lastSentAt).toISOString()} — ${String(dot.lastSentText || '').replace(/\s+/g, ' ').slice(0, 60)}`)
+      } else {
+        console.log('last sent: never (this record)')
+      }
+      if (msgs.length) console.log('latest: ' + renderDotMessage(msgs[msgs.length - 1]).slice(0, 120))
+      if (batch.messages.length) console.log('run: chatgpt-web dot --poll')
+    })
   })
 }
 
+// runDotPoll delivers at-least-once: output is written before the
+// checkpoint advances, so a crash in between can replay a message on the
+// next poll. The v2 checkpoint retains delivered ids; a full page with no
+// checkpoint overlap is refused rather than silently truncating history.
 export async function runDotPoll(asJson) {
-  const dot = await ensureDotRecord()
-  await withDotReadPage(async (page) => {
-    const msgs = await fetchDotMessages(page, dot)
-    if (!dot.watermark) {
-      const wm = watermarkAt(msgs)
-      await updateDot((d) => ({ ...(d || dot), watermark: wm }))
-      console.log(`tracking ${msgs.length} messages (watermark set, nothing printed) — run: chatgpt-web dot --context 20 for history`)
-      return
-    }
-    const fresh = messagesAfter(msgs, dot.watermark)
-    if (asJson) {
-      console.log(JSON.stringify({ room: dot.roomId, url: dot.url, messages: fresh }, null, 2))
-    } else {
-      if (!fresh.length) console.log('no new messages')
-      for (const m of fresh) console.log(renderDotMessage(m))
-    }
-    const wm = watermarkAt(msgs)
-    if (wm) await updateDot((d) => ({ ...(d || dot), watermark: wm }))
+  await withDotOperation(async () => {
+    const dot = await ensureDotRecord()
+    await withDotReadPage(async (page) => {
+      const msgs = await fetchDotMessages(page, dot)
+      const legacy = dot.watermark && dot.watermark.v !== 2
+      assertDotWindow(msgs, dot.watermark, DOT_MSG_PAGE_LIMIT)
+      const batch = dotPollBatch(msgs, dot.watermark, { limit: DOT_MSG_PAGE_LIMIT })
+      const payload = {
+        room: dot.roomId,
+        url: dot.url,
+        initialized: batch.initialized,
+        messages: batch.messages,
+      }
+      if (asJson) {
+        await writeOutput(process.stdout, JSON.stringify(payload, null, 2) + '\n')
+      } else if (batch.initialized) {
+        console.log(`tracking ${msgs.length} messages (watermark set, nothing printed) — run: chatgpt-web dot --context 20 for history`)
+      } else {
+        if (!batch.messages.length) console.log('no new messages')
+        for (const m of batch.messages) console.log(renderDotMessage(m))
+      }
+      if (legacy) {
+        console.error('note: dot checkpoint upgraded to v2 — a one-time replay of older messages is possible')
+      }
+      if (batch.watermark) {
+        await updateDot((current) => {
+          if (!current || current.roomId !== dot.roomId || current.dotId !== dot.dotId) {
+            throw new Error('dot binding changed during poll')
+          }
+          return { ...current, watermark: batch.watermark }
+        })
+      }
+    })
   })
 }
 
 export async function runDotContext(count, asJson) {
-  const dot = await ensureDotRecord()
-  await withDotReadPage(async (page) => {
-    const msgs = await fetchDotMessages(page, dot)
-    const slice = msgs.slice(-count)
-    if (asJson) {
-      console.log(JSON.stringify({ room: dot.roomId, url: dot.url, messages: slice }, null, 2))
-      return
-    }
-    if (!slice.length) {
-      console.log('no messages on record')
-      return
-    }
-    for (const m of slice) console.log(renderDotMessage(m))
+  await withDotOperation(async () => {
+    const dot = await ensureDotRecord()
+    await withDotReadPage(async (page) => {
+      // The messaging endpoint 422s above 32; the parser enforces 1..32.
+      const msgs = await fetchDotMessages(page, dot)
+      const slice = msgs.slice(-count)
+      if (asJson) {
+        console.log(JSON.stringify({ room: dot.roomId, url: dot.url, messages: slice }, null, 2))
+        return
+      }
+      if (!slice.length) {
+        console.log('no messages on record')
+        return
+      }
+      for (const m of slice) console.log(renderDotMessage(m))
+    })
   })
 }
 
 export async function runDotReset() {
-  const had = await updateDot(() => null)
-  console.log(had ? `cleared dot record for room ${had.roomId}` : 'no dot record stored')
+  await withDotOperation(async () => {
+    // updateDot returns the mutator's value (null here), NOT the previous
+    // record — capture it inside the mutator or the command always reports
+    // "no dot record stored".
+    let previous = null
+    await updateDot((current) => {
+      previous = current
+      return null
+    })
+    console.log(previous ? `cleared dot record for room ${previous.roomId}` : 'no dot record stored')
+  })
 }
 
 // sendDotPromptGuarded is the dot-side mirror of sendPromptGuarded: it
-// re-validates the /dots/<id> route, the composer contents, and the enabled
-// Send button in one evaluation, then clicks. The dot composer's submit is
-// button[aria-label="Send"], not #composer-submit-button (verified shape).
+// re-validates the /dots/<id> route, the composer contents (exact authored
+// text, line endings only), attachment emptiness, and a unique visible
+// enabled Send button in one evaluation, then clicks. The dot composer's
+// submit is button[aria-label="Send"], not #composer-submit-button
+// (verified shape).
 async function sendDotPromptGuarded(page, { dotId, prompt }) {
   const result = await page
     .evaluate(
@@ -1961,95 +2281,123 @@ async function sendDotPromptGuarded(page, { dotId, prompt }) {
         if (location.origin !== 'https://chatgpt.com') return { error: 'unexpected origin' }
         const route = location.pathname.match(/^\/dots\/([0-9a-fA-F-]{8,})\/?$/)
         if (!route || route[1] !== wantDot) return { error: 'not on the dot thread before submission' }
-        const composer = document.querySelector(selectors.composer)
-        if (!composer) return { error: 'composer disappeared before submission' }
+        const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden'
+        const composers = [...document.querySelectorAll(selectors.composer)].filter(visible)
+        if (composers.length !== 1) {
+          return {
+            error: composers.length === 0 ? 'composer disappeared before submission' : 'multiple dot composers visible before submission',
+          }
+        }
+        const composer = composers[0]
         const text = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
-        const flat = text.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
-        if (flat !== promptText) return { error: 'composer changed before submission' }
-        const button = Array.from(document.querySelectorAll(selectors.submit)).find(
-          (b) => !b.disabled && b.getAttribute('aria-disabled') !== 'true' && b.offsetParent !== null
+        const actual = String(text).replace(/\r\n/g, '\n')
+        if (actual !== promptText) return { error: 'composer changed before submission', saw: actual.slice(0, 90) }
+        // The dot surface has no --file support: the attachment slot must
+        // be structurally empty (sentinel with zero children) or chip-free.
+        const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement
+        if (scope) {
+          const container = scope.querySelector(selectors.attachContainer)
+          if (container ? container.childElementCount > 0 : scope.querySelectorAll(selectors.chips).length > 0) {
+            return { error: 'dot attachments are not supported — remove the attachment before sending' }
+          }
+        }
+        const buttons = [...document.querySelectorAll(selectors.submit)].filter(
+          (b) => visible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true'
         )
-        if (!button) return { error: 'dot Send button is missing or disabled' }
-        button.click()
+        if (buttons.length !== 1) {
+          return {
+            error: buttons.length === 0 ? 'dot Send button is missing or disabled' : 'multiple dot Send buttons visible before submission',
+          }
+        }
+        buttons[0].click()
         return { ok: true }
       },
       {
         wantDot: dotId,
-        promptText: normPrompt(prompt),
-        selectors: { composer: COMPOSER_SEL, submit: DOT_SUBMIT_SEL },
+        promptText: canonicalPrompt(prompt),
+        selectors: {
+          composer: COMPOSER_SEL,
+          submit: DOT_SUBMIT_SEL,
+          chips: ATTACH_CHIP_SEL,
+          attachContainer: ATTACH_CONTAINER_SEL,
+        },
       }
     )
     .catch((e) => ({ error: e.message }))
-  if (!result?.ok) throw new Error('dot submission guard: ' + (result?.error || 'unknown result'))
+  if (!result?.ok) {
+    const detail = result?.saw ? ` (held: ${JSON.stringify(result.saw)})` : ''
+    throw new Error('dot submission guard: ' + (result?.error || 'unknown result') + detail)
+  }
 }
 
-export async function runDotSend(text) {
+// runDotSend sends one message into the dot thread. Acceptance is
+// API-ONLY: a NEW message id authored by this account whose authored text
+// is exactly the prompt. The old DOM self-row count fallback mistook
+// hydration (or another device's send) for acceptance — a larger row count
+// is not evidence this send landed. Failure to verify is an uncertain
+// send, never a successful one. `reservation` (when the CLI created a
+// dot-send store generation) is ownership-checked before the click.
+export async function runDotSend(text, reservation = null) {
   if (!text || !String(text).trim()) throw new Error('dot message is empty')
   const prompt = String(text)
-  const dot = await ensureDotRecord()
-  await ensureBrowser()
-  await withPage(async (page) => {
-    await page.goto(dot.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
-    await waitForComposer(page)
+  await withDotOperation(async () => {
+    const dot = await ensureDotRecord()
+    await ensureBrowser()
+    await withPage(async (page) => {
+      await page.goto(dot.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      await waitForComposer(page)
 
-    await withLock('send', async () => {
-      const s = await updateState((st) => st)
-      const L = limits()
-      const since = Date.now() - (s.lastSendAt || s.lastTurnEnd || 0)
-      const gap = L.minGapMs + Math.random() * 8000
-      if (since < gap) await sleep(gap - since)
-      await sleep(jitter(1500, 4000))
+      await withLock('send', async () => {
+        const s = await updateState((st) => st)
+        const L = limits()
+        const since = Date.now() - (s.lastSendAt || s.lastTurnEnd || 0)
+        const gap = L.minGapMs + Math.random() * 8000
+        if (since < gap) await sleep(gap - since)
+        await sleep(jitter(1500, 4000))
 
-      const composer = await waitForComposer(page)
-      if (dotRouteId(page.url()) !== dot.dotId) {
-        await page.goto(dot.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
-        await sleep(jitter(1500, 3000))
-        if (dotRouteId(page.url()) !== dot.dotId) throw new Error('tab is not on the dot thread — refusing to send')
-      }
-      const priorSelfRows = await page.locator(DOT_SELF_ROW_SEL).count().catch(() => 0)
-      const prior = await fetchDotMessages(page, dot, 20)
-      const priorMineIds = prior.filter((m) => m.mine).map((m) => m.id)
-
-      await typePrompt(page, composer, prompt)
-      await sendDotPromptGuarded(page, { dotId: dot.dotId, prompt })
-      await updateState((st) => {
-        st.lastSendAt = Date.now()
-      })
-
-      // Acceptance: a NEW message authored by me whose authored text matches,
-      // API-first; the DOM self-row count is the fallback if the endpoint
-      // hiccups. The dot surface has no /c/<id> accepted-prompt endpoint.
-      const deadline = Date.now() + 60000
-      let accepted = null
-      while (Date.now() < deadline && !accepted) {
-        try {
-          const now = await fetchDotMessages(page, dot, 20)
-          accepted =
-            now.find((m) => m.mine && !priorMineIds.includes(m.id) && normPrompt(m.text) === normPrompt(prompt)) || null
-        } catch {}
-        if (!accepted) {
-          const rows = await page.locator(DOT_SELF_ROW_SEL).count().catch(() => 0)
-          if (rows > priorSelfRows) {
-            accepted = { id: 'dom-self-row', at: Date.now(), iso: new Date().toISOString(), mine: true, text: prompt }
-          }
+        const composer = await waitForComposer(page)
+        if (dotRouteId(page.url()) !== dot.dotId) {
+          await page.goto(dot.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+          await sleep(jitter(1500, 3000))
+          if (dotRouteId(page.url()) !== dot.dotId) throw new Error('tab is not on the dot thread — refusing to send')
         }
-        if (!accepted) await sleep(jitter(1500, 2500))
-      }
-      if (!accepted) throw new Error('the dot message was not observed as sent — check the thread manually')
+        // API baseline: my message ids present before the click.
+        const prior = await fetchDotMessages(page, dot, 20)
+        const priorMineIds = new Set(prior.filter((m) => m.mine).map((m) => m.id))
 
-      // The watermark moves to the sent message, not the room tip: a fast
-      // dot reply must survive for the next poll.
-      const wm = { t: accepted.at, ids: [accepted.id] }
-      await updateDot((d) => ({
-        ...(d || dot),
-        watermark: wm,
-        lastSentAt: Date.now(),
-        lastSentText: prompt,
-      }))
-      console.log(`sent to dot room ${dot.roomId}`)
-      console.log(`thread: ${dot.url}`)
-      console.log(`message: ${String(prompt).replace(/\s+/g, ' ').slice(0, 80)}`)
-      console.log('replies land on their own schedule — read them: chatgpt-web dot --poll')
+        if (reservation) assertOwnedBeforeMutation(reservation.jobId, reservation.turnId)
+        await typePrompt(page, composer, prompt)
+        await sendDotPromptGuarded(page, { dotId: dot.dotId, prompt })
+        await updateState((st) => {
+          st.lastSendAt = Date.now()
+        })
+
+        const deadline = Date.now() + 60000
+        let accepted = null
+        while (Date.now() < deadline && !accepted) {
+          const now = await fetchDotMessages(page, dot, 20).catch(() => null)
+          if (now) {
+            accepted = now.find((m) => m.mine && !priorMineIds.has(m.id) && samePrompt(m.text, prompt)) || null
+          }
+          if (!accepted) await sleep(jitter(1500, 2500))
+        }
+        if (!accepted) {
+          throw new Error(
+            'the dot message was not observed as a new API message — it may still have been sent; inspect the thread manually before retrying'
+          )
+        }
+        // The sent id joins the delivered set, but the READ checkpoint is
+        // not advanced by a send: unread messages older than this send
+        // survive for the next poll, and a fast dot reply is still fresh.
+        await updateDot((current) => {
+          if (!current || current.roomId !== dot.roomId) throw new Error('dot binding changed during send')
+          return afterDotSend(current, accepted, prompt)
+        })
+        console.log(`sent to dot room ${dot.roomId}`)
+        console.log(`thread: ${dot.url}`)
+        console.log(`message: ${String(prompt).replace(/\s+/g, ' ').slice(0, 80)}`)
+        console.log('replies land on their own schedule — read them: chatgpt-web dot --poll')
+      })
     })
   })
 }
@@ -2057,7 +2405,7 @@ export async function runDotSend(text) {
 export async function runStatus() {
   const up = !!(await cdpVersion())
   const mode = !up ? '' : chromeIsHeadlessBin() ? ', headless' : wantHeadless() ? ', hidden' : ', windowed'
-  console.log('daemon:', up ? 'up (CDP port ' + CDP_PORT + mode + ')' : 'down (next command starts it)')
+  console.log('daemon:', up ? 'up (CDP port ' + validateRunnerConfig().cdpPort + mode + ')' : 'down (next command starts it)')
   const s = readState()
   const L = limits()
   const hourChats = (s.newChats || []).filter((t) => Date.now() - t < 3600000).length
@@ -2081,11 +2429,4 @@ export async function runStatus() {
       console.log('session:', state === 'in' ? 'logged in' : state === 'out' ? 'logged out — run: chatgpt-web login' : 'unknown')
     })
   }
-}
-
-const [cmd, arg, turnId] = process.argv.slice(2)
-if (cmd === 'job') {
-  await runTurn(arg, turnId)
-} else if (cmd === 'resume') {
-  await runResume(arg, turnId)
 }

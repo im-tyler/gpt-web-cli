@@ -16,17 +16,17 @@ chatgpt-web login                         # log in once; session lives in the da
 chatgpt-web start "prompt"                # prints a job id, returns immediately
 chatgpt-web wait <id>                     # blocks, prints the reply (--stream for live output)
 chatgpt-web send <id> "follow-up"         # continue the same conversation
-chatgpt-web start "prompt" --file a.png   # attach files
+chatgpt-web start "prompt" --file a.png   # attach files (uploads need a UI remap on the 2026-10 chat surface)
 chatgpt-web list                          # CLI jobs
 chatgpt-web chats                         # account conversations
-chatgpt-web model                         # list available models
-chatgpt-web model "5.2 thinking"          # switch (manual only, persists)
+chatgpt-web model                         # list models + current power stop (read-only)
+chatgpt-web model "6 pro"                 # switch (manual only, persists)
 chatgpt-web files <chat-id>               # list file artifacts from a chat
-chatgpt-web download <chat-id> [n|all]    # download them
+chatgpt-web download <chat-id> [n|all] [outdir]    # download them
 chatgpt-web dot                           # bind + status of the account's dot
 chatgpt-web dot "message"                 # send into the dot thread (no reply wait)
 chatgpt-web dot --poll                    # messages since last poll
-chatgpt-web dot --context 20              # last 20 dot messages
+chatgpt-web dot --context 20              # last 20 dot messages (max 32)
 chatgpt-web status                        # daemon, session, usage vs caps
 ```
 
@@ -39,4 +39,4 @@ chatgpt-web status                        # daemon, session, usage vs caps
 - Job admission, reaping and capacity are one store transaction: concurrent `start`/`send` cannot exceed the caps or double-claim a job, a dead runner is filed conditionally (a completed reply can never be overwritten by a stale error), and state accounting is serialised so counters cannot lose increments.
 - `download` never clobbers: artifacts get id-tagged, collision-suffixed names and pre-existing files or symlinks are refused, not overwritten.
 - `dot` talks to the account's always-on dot (ChatGPT messaging room, not a `/c/<id>` thread): sends are paced, capped turns into the existing thread with API-verified acceptance, replies are read by polling (`--poll` advances a watermark, `--context` never touches it). Dot conversations do not count against ChatGPT usage limits; Work/Codex tasks the dot starts do.
-- `node --test store.test.mjs` covers the store and download invariants.
+- `node --test` covers the store, CLI parsing, prompt identity, reply inspection, dot checkpoints, deletion planning and download invariants.

@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import fs from 'node:fs'
 import crypto from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,15 +18,12 @@ import {
   sleep,
   limits,
 } from './jobs.mjs'
-import { spawnRunnerLogged, createSnapshotWriter, positiveInteger } from './core-fixes.mjs'
+import { spawnRunnerLogged, positiveInteger } from './core-fixes.mjs'
+import { parseCli, conversationId, assertWaitGeneration } from './audit-core.mjs'
+import { writeOutput, validateUploads } from './audit-io.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const RUNNER = path.join(__dirname, 'runner.mjs')
-
-function err(msg) {
-  console.error(String(msg))
-  process.exit(1)
-}
+const RUNNER = path.join(__dirname, 'runner-entry.mjs')
 
 function usage() {
   console.log(`usage: chatgpt-web <command>
@@ -37,26 +33,30 @@ function usage() {
   send <id> "text"    send a follow-up in the job's conversation (prints job id)
   resume <id>         retry a failed assistant turn in standard ChatGPT (never clicks "Use Work")
   wait <id> [secs]    block until the job finishes, print the reply (default 600s)
-                      optional: --stream prints the reply as it grows
+                      optional: --stream prints reply revisions as they grow
+                      --turn <turnId> pins a generation; --json prints a
+                      structured final result (not combinable with --stream)
   list                list jobs
   status              daemon, session, usage caps, running job
   chats               list ChatGPT conversations (id, async status, updated, title)
-  chats --delete <id>... | chats --delete --all
-                      soft-delete conversations (30-day recovery in Deleted chats)
-  model [name]        list models + the power slider's stops (current marked),
-                       or set one by name fragment — a named model or a slider
-                       stop, e.g. "6 pro" (manual only; the CLI never switches
-                       models on its own. The slider is account-wide: sends
-                       inherit whatever it holds)
+  chats --delete <id>... | chats --delete --all --yes
+                      hide conversations from the sidebar (destructive; --all
+                      needs --yes and a complete listing)
+  model [name]        list models + the current power-slider stop (read-only),
+                        or set one by name fragment — a named model or a slider
+                        stop, e.g. "6 pro" (manual only; the CLI never switches
+                        models on its own. The slider is account-wide: sends
+                        inherit whatever it holds)
   files <chat-id>     list files created in a conversation
   download <chat-id> [n|all] [outdir]
                       save conversation files to disk (default: all, current dir)
   dot                 bind + status of the account's dot thread
   dot "message"       send one message into the dot thread (paced, capped turn;
-                      no reply wait — the dot answers on its own horizon)
+                      no reply wait — the dot answers on its own horizon.
+                      Recorded as a dot-send job: done means sent, not replied)
   dot --poll [--json] print messages since the last poll, advance watermark
   dot --context [n] [--json]
-                      print the last n messages (default 20), watermark untouched
+                      print the last n messages (1..32; watermark untouched)
   dot --reset         forget the stored dot thread (re-discovered on next use)
   login               open the chatgpt-web Chrome window and wait until you log in
 
@@ -77,15 +77,7 @@ Chrome window; sends are paced globally, response waits happen in parallel.`)
 }
 
 function checkPrompt(prompt) {
-  if (!prompt || !prompt.trim()) err('prompt is empty or whitespace only')
-}
-
-function parseCount(label, raw, opts = {}) {
-  try {
-    return positiveInteger(raw, label, opts)
-  } catch (e) {
-    err(e.message)
-  }
+  if (!prompt || !prompt.trim()) throw new Error('prompt is empty or whitespace only')
 }
 
 // launchAdmitted starts the worker for an admitted turn generation and
@@ -105,9 +97,7 @@ async function launchAdmitted(job, mode = 'job') {
 
 async function cmdStart(prompt, files) {
   checkPrompt(prompt)
-  for (const f of files) {
-    if (!fs.existsSync(f)) err(`no such file: ${f}`)
-  }
+  const checked = validateUploads(files)
   ensureDirs()
   await reapStale()
 
@@ -131,7 +121,7 @@ async function cmdStart(prompt, files) {
     admitted = turns.createLocked({
       id: newIdSafe(),
       prompt,
-      files: files.map((f) => path.resolve(f)),
+      files: checked,
       reply: null,
       url: null,
       history: [{ role: 'user', text: prompt }],
@@ -139,11 +129,11 @@ async function cmdStart(prompt, files) {
       rev: 0,
     })
   })
-  if (limErr) err(limErr)
+  if (limErr) throw new Error(limErr)
   try {
     await launchAdmitted(admitted)
   } catch (e) {
-    err(e.message)
+    throw new Error(e.message)
   }
   console.log(admitted.id)
 }
@@ -155,9 +145,7 @@ function newIdSafe() {
 
 async function cmdSend(id, text, files) {
   checkPrompt(text)
-  for (const f of files) {
-    if (!fs.existsSync(f)) err(`no such file: ${f}`)
-  }
+  const checked = validateUploads(files)
   ensureDirs()
   await reapStale()
 
@@ -167,6 +155,10 @@ async function cmdSend(id, text, files) {
     const job = readJob(id)
     if (!job) {
       limErr = `no such job: ${id}`
+      return
+    }
+    if (job.kind === 'dot-send') {
+      limErr = 'dots are messaged with: chatgpt-web dot "text" (no send/resume/wait)'
       return
     }
     if (job.status === 'running' || job.status === 'streaming') {
@@ -189,20 +181,20 @@ async function cmdSend(id, text, files) {
     })
     if (limErr) return
     // beginLocked is the explicit new-turn transition: it vacates the
-    // previous terminal state under a fresh generation, which the old
-    // persistence guard refused — leaving `send` to launch a worker that
-    // re-sent the previous prompt.
+    // previous terminal state under a fresh generation (clearing stale
+    // provenance), which the old persistence guard refused — leaving
+    // `send` to launch a worker that re-sent the previous prompt.
     try {
-      admitted = turns.beginLocked(id, text, files.map((f) => path.resolve(f)))
+      admitted = turns.beginLocked(id, text, checked)
     } catch (e) {
       limErr = e.message
     }
   })
-  if (limErr) err(limErr)
+  if (limErr) throw new Error(limErr)
   try {
     await launchAdmitted(admitted)
   } catch (e) {
-    err(e.message)
+    throw new Error(e.message)
   }
   console.log(id)
 }
@@ -220,6 +212,10 @@ async function cmdResume(id) {
     const job = readJob(id)
     if (!job) {
       limErr = `no such job: ${id}`
+      return
+    }
+    if (job.kind === 'dot-send') {
+      limErr = 'dots are messaged with: chatgpt-web dot "text" (no send/resume/wait)'
       return
     }
     if (job.status === 'running' || job.status === 'streaming') {
@@ -247,57 +243,80 @@ async function cmdResume(id) {
       limErr = e.message
     }
   })
-  if (limErr) err(limErr)
+  if (limErr) throw new Error(limErr)
   try {
     await launchAdmitted(admitted, 'resume')
   } catch (e) {
-    err(e.message)
+    throw new Error(e.message)
   }
   console.log(id)
 }
 
-async function cmdWait(id, timeoutSec, stream) {
-  let timeout = 600000
-  if (timeoutSec !== undefined) {
-    timeout = parseCount('wait seconds', timeoutSec, { max: 86400 }) * 1000
-  }
+// cmdWait blocks on a PINNED turn generation: once a wait starts, the job
+// record moving to a newer turn (error → resume/send) is reported as a
+// supersession, never silently answered with the newer turn's reply.
+async function cmdWait(id, timeoutSec, stream, opts = {}) {
+  const timeout = timeoutSec === undefined ? 600000 : positiveInteger(timeoutSec, 'wait seconds', { max: 86400 }) * 1000
   ensureDirs()
+  await reapStale()
+  const initial = readJob(id)
+  if (!initial) throw new Error('no such job: ' + id)
+  if (initial.kind === 'dot-send') {
+    throw new Error('dot sends have no reply wait — the dot answers on its own horizon; poll: chatgpt-web dot --poll')
+  }
+  const expectedTurnId = opts.turn || initial.turnId
+  assertWaitGeneration(initial, expectedTurnId)
   const deadline = Date.now() + timeout
-  // The printed stream is a sequence of revisions, not a guaranteed prefix
-  // of the final reply: a replacement is labelled and reprinted in full
-  // rather than spliced onto the old text.
-  const writer = stream ? createSnapshotWriter((s) => process.stdout.write(s)) : null
+  let previous = ''
+  let nextReap = 0
   for (;;) {
-    const j = readJob(id)
-    if (!j) err(`no such job: ${id}`)
-    if (writer && (j.status === 'streaming' || j.status === 'done')) {
-      writer(j.reply ?? '')
+    if (Date.now() >= nextReap) {
+      await reapStale() // includes admitted-but-unclaimed startup failures
+      nextReap = Date.now() + 1000
+    }
+    const j = assertWaitGeneration(readJob(id), expectedTurnId)
+    // The printed stream is a sequence of revisions, not a guaranteed
+    // prefix of the final reply: a replacement is labelled and reprinted
+    // in full rather than spliced onto the old text.
+    if (stream && typeof j.reply === 'string' && j.reply !== previous) {
+      const bytes = j.reply.startsWith(previous)
+        ? j.reply.slice(previous.length)
+        : '\n[reply revised; complete replacement follows]\n' + j.reply
+      await writeOutput(process.stdout, bytes)
+      previous = j.reply
     }
     if (j.status === 'done') {
-      if (!stream) process.stdout.write((j.reply || '') + '\n')
-      else process.stdout.write('\n')
+      if (opts.json) {
+        await writeOutput(
+          process.stdout,
+          JSON.stringify({
+            id: j.id,
+            turnId: j.turnId ?? null,
+            status: j.status,
+            url: j.url ?? null,
+            acceptedUserId: j.acceptedUserId ?? null,
+            assistantMessageId: j.assistantMessageId ?? null,
+            reply: j.reply ?? '',
+            replyKind: j.replyKind ?? 'text',
+          }) + '\n'
+        )
+      } else if (!stream) {
+        await writeOutput(
+          process.stdout,
+          (j.replyKind === 'non-text'
+            ? '[completed with non-text output; inspect the conversation files]'
+            : j.reply ?? '') + '\n'
+        )
+      } else {
+        await writeOutput(process.stdout, '\n')
+      }
       return
     }
-    if (j.status === 'error') err(j.error || 'job failed')
-    if ((j.status === 'running' || j.status === 'streaming') && j.pid && !pidAliveLocal(j.pid)) {
-      // Conditional: the worker may have committed a terminal state between
-      // the read above and now; reapStale re-reads under the store lock.
-      await reapStale()
-      const now = readJob(id)
-      if (now.status === 'error') err(now.error || 'runner died')
+    if (j.status === 'error') throw new Error(j.error || 'job failed')
+    if (Date.now() >= deadline) {
+      throw new Error(`wait timed out after ${timeout / 1000}s — the worker was not cancelled; retry: chatgpt-web wait ${id}`)
     }
-    if (Date.now() > deadline) err(`timed out after ${timeout / 1000}s — job still running, retry: chatgpt-web wait ${id}`)
-    await sleep(400)
-  }
-}
-
-function pidAliveLocal(pid) {
-  if (!pid) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (e) {
-    return e.code === 'EPERM'
+    await sleep(Math.min(400, Math.max(0, deadline - Date.now())))
   }
 }
 
@@ -313,26 +332,16 @@ function cmdList() {
     const turnCount = String(Math.max(1, Math.ceil((j.history || []).length / 2)))
     const updated = (j.updatedAt || '').replace('T', ' ').slice(0, 19)
     const prompt = (j.prompt || '').replace(/\s+/g, ' ').slice(0, 48)
-    console.log([j.id.padEnd(14), j.status.padEnd(8), turnCount.padEnd(6), updated.padEnd(20), prompt].join(''))
+    console.log([String(j.id).padEnd(14), String(j.status).padEnd(8), turnCount.padEnd(6), updated.padEnd(20), prompt].join(''))
   }
 }
 
 async function cmdLogin() {
   ensureDirs()
   const running = runningJobs()
-  if (running.length) err(`jobs running (${running.map((j) => j.id).join(', ')}) — wait for them first`)
+  if (running.length) throw new Error(`jobs running (${running.map((j) => j.id).join(', ')}) — wait for them first`)
   const { runLogin } = await import('./runner.mjs')
   await runLogin()
-}
-
-async function cmdChats(restArgs) {
-  ensureDirs()
-  const wantsDelete = restArgs.includes('--delete')
-  const deleteAll = wantsDelete && restArgs.includes('--all')
-  const ids = restArgs.filter((x) => x !== '--delete' && x !== '--all')
-  if (wantsDelete && !deleteAll && !ids.length) err('chats --delete needs chat ids or --all')
-  const { runChats } = await import('./runner.mjs')
-  await runChats({ deleteIds: wantsDelete && !deleteAll ? ids : null, deleteAll })
 }
 
 async function cmdRunner(fn, ...args) {
@@ -341,118 +350,119 @@ async function cmdRunner(fn, ...args) {
   await mod[fn](...args)
 }
 
-// cmdDot dispatches the dot subcommand. A message send is admitted exactly
-// like cmdSend (tab slot, daily cap, turn record — never the new-chat cap,
-// the thread already exists), while reads are free like `chats`.
-async function cmdDot(args, files) {
-  if (files.length) err('dot does not support --file')
-  let json = false
-  let poll = false
-  let reset = false
-  let context = null
-  const text = []
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]
-    if (a === '--json') json = true
-    else if (a === '--poll') poll = true
-    else if (a === '--reset') reset = true
-    else if (a === '--context') {
-      const n = args[i + 1]
-      if (n !== undefined && !n.startsWith('--')) {
-        context = parseCount('context count', n, { max: 500 })
-        i++
-      } else {
-        context = 20
-      }
-    } else text.push(a)
-  }
-  const modes = [poll, reset, context !== null, text.length > 0].filter(Boolean).length
-  if (modes > 1) err('dot: choose one of a message, --poll, --context [n], --reset')
-  if (text.length > 1) err('dot: pass the message as one quoted argument')
+// cmdDotMessage admits and runs one dot send. The message is dispatched
+// from ALREADY-PARSED argv (a literal "--poll" reached here as text through
+// `--`; it must never be re-parsed). A dot send occupies a real store
+// generation (kind dot-send): its slot is visible to admission, a dead CLI
+// process is filed via the startup lease/reaper, and 'done' means sent —
+// never 'assistant replied'.
+async function cmdDotMessage(text) {
+  checkPrompt(text)
   ensureDirs()
-  if (reset) return cmdRunner('runDotReset')
-  if (context !== null) return cmdRunner('runDotContext', context, json)
-  if (poll) return cmdRunner('runDotPoll', json)
-  if (text.length === 1) {
-    await reapStale()
-    let limErr = null
-    await withStoreLock(async () => {
-      const running = runningJobs()
-      if (running.length >= limits().maxTabs) {
-        limErr = `${running.length} turns already running (max ${limits().maxTabs}, CHATGPT_WEB_MAX_TABS) — wait: chatgpt-web wait ${running[0].id}`
-        return
-      }
-      limErr = await updateState((s) => {
-        const e = checkLimits(s, false)
-        if (!e) recordTurn(s, false)
-        return e
-      })
+  await reapStale()
+  let limErr = null
+  let admitted = null
+  await withStoreLock(async () => {
+    const running = runningJobs()
+    if (running.length >= limits().maxTabs) {
+      limErr = `${running.length} turns already running (max ${limits().maxTabs}, CHATGPT_WEB_MAX_TABS) — wait: chatgpt-web wait ${running[0].id}`
+      return
+    }
+    limErr = await updateState((s) => {
+      const e = checkLimits(s, false)
+      if (!e) recordTurn(s, false)
+      return e
     })
-    if (limErr) err(limErr)
-    return cmdRunner('runDotSend', text[0])
+    if (limErr) return
+    admitted = turns.createLocked({
+      id: newIdSafe(),
+      kind: 'dot-send',
+      prompt: text,
+      files: [],
+      reply: null,
+      url: null,
+      history: [{ role: 'user', text }],
+      error: null,
+      rev: 0,
+    })
+  })
+  if (limErr) throw new Error(limErr)
+  const claimed = await turns.claim(admitted.id, admitted.turnId, process.pid)
+  if (!claimed) throw new Error('dot-send reservation was superseded before launch')
+  const { runDotSend } = await import('./runner.mjs')
+  try {
+    await runDotSend(text, { jobId: admitted.id, turnId: admitted.turnId })
+    await turns.update(admitted.id, admitted.turnId, (j) => {
+      j.status = 'done'
+      j.submissionState = 'sent'
+      j.error = null
+    })
+  } catch (e) {
+    await turns.update(admitted.id, admitted.turnId, (j) => {
+      j.status = 'error'
+      j.error = String(e.message || e)
+    })
+    throw e
   }
-  return cmdRunner('runDotStatus')
+  console.log(`dot-send job: ${admitted.id} (done = sent, not replied)`)
 }
 
-const raw = process.argv.slice(2)
-const fileArgs = []
-const rest = []
-for (let i = 0; i < raw.length; i++) {
-  if (raw[i] === '--file' || raw[i] === '-f') {
-    if (!raw[i + 1]) err('--file needs a path')
-    fileArgs.push(raw[i + 1])
-    i++
-  } else if (raw[i] === '--stream') {
-    rest.push('--stream')
-  } else {
-    rest.push(raw[i])
+async function main(argv) {
+  const { command, args, options } = parseCli(argv)
+  switch (command) {
+    case 'help':
+      return usage()
+    case 'start':
+      return cmdStart(args[0], options.file || [])
+    case 'send':
+      return cmdSend(args[0], args[1], options.file || [])
+    case 'resume':
+      return cmdResume(args[0])
+    case 'wait':
+      return cmdWait(args[0], args[1], !!options.stream, options)
+    case 'list':
+      await reapStale()
+      return cmdList()
+    case 'status':
+      await reapStale()
+      return cmdRunner('runStatus')
+    case 'login':
+      await reapStale()
+      return cmdLogin()
+    case 'chats':
+      return cmdRunner('runChats', {
+        deleteIds: options.delete && !options.all ? args : null,
+        deleteAll: !!options.all,
+        yes: !!options.yes,
+      })
+    case 'model':
+      // Fragments are multi-word: "model 6 pro" must reach the matcher as
+      // "6 pro", not just "6".
+      return cmdRunner('runModel', args.join(' '))
+    case 'files':
+      return cmdRunner('runFiles', conversationId(args[0]))
+    case 'download':
+      // The outdir comes from the parsed operand list, like every other
+      // operand — it used to read raw argv, which shifted with flag order.
+      return cmdRunner('runDownload', conversationId(args[0]), args[1], args[2])
+    case 'dot': {
+      // Flags were validated against the dot contract by parseCli; the
+      // message branch hands ALREADY-PARSED text to admission — never a
+      // second parsing stage.
+      if (options.reset) return cmdRunner('runDotReset')
+      if (options.context !== undefined) return cmdRunner('runDotContext', options.context, !!options.json)
+      if (options.poll) return cmdRunner('runDotPoll', !!options.json)
+      if (!args.length) return cmdRunner('runDotStatus')
+      return cmdDotMessage(args[0])
+    }
+    default:
+      throw new Error(`unknown command: ${command} — run: chatgpt-web help`)
   }
 }
-const stream = rest.includes('--stream')
-const positional = rest.filter((x) => x !== '--stream')
-const [cmd, a, b, c] = positional
-switch (cmd) {
-  case 'start':
-    await cmdStart(a, fileArgs)
-    break
-  case 'send':
-    await cmdSend(a, b, fileArgs)
-    break
-  case 'resume':
-    await cmdResume(a)
-    break
-  case 'wait':
-    await cmdWait(a, b, stream)
-    break
-  case 'list':
-    cmdList()
-    break
-  case 'chats':
-    await cmdChats(positional.slice(1))
-    break
-  case 'dot':
-    await cmdDot(positional.slice(1), fileArgs)
-    break
-  case 'model':
-    // Fragments are multi-word: "model 6 pro" must reach the matcher as
-    // "6 pro", not just "6".
-    await cmdRunner('runModel', positional.slice(1).join(' '))
-    break
-  case 'files':
-    await cmdRunner('runFiles', a)
-    break
-  case 'download':
-    // The outdir comes from the filtered positional list, like every other
-    // operand — it used to read raw argv, which shifted with flag order.
-    await cmdRunner('runDownload', a, b, c)
-    break
-  case 'status':
-    await cmdRunner('runStatus')
-    break
-  case 'login':
-    await cmdLogin()
-    break
-  default:
-    usage()
-    process.exit(cmd ? 1 : 0)
+
+try {
+  await main(process.argv.slice(2))
+} catch (e) {
+  console.error(String(e.message || e))
+  process.exitCode = 1
 }

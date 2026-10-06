@@ -15,6 +15,18 @@ import crypto from 'node:crypto'
 const active = (j) => j && (j.status === 'running' || j.status === 'streaming')
 const terminal = (j) => j && (j.status === 'done' || j.status === 'error')
 
+// Provenance fields every fresh generation starts clean with: stale
+// accepted/assistant ids from a previous turn must never survive onto a new
+// one (they are what reply association and retry authorization hang on).
+const CLEAN_PROVENANCE = {
+  acceptedUserId: null,
+  assistantMessageId: null,
+  priorUserIds: [],
+  submissionState: 'not-submitted',
+  replyKind: null,
+  replyContent: null,
+}
+
 export function makeTurnStore({ readJob, commitLocked, withStoreLock, now = () => new Date().toISOString() }) {
   function commit(previous, next) {
     next.rev = (previous?.rev || 0) + 1
@@ -25,8 +37,10 @@ export function makeTurnStore({ readJob, commitLocked, withStoreLock, now = () =
   function createLocked(job) {
     if (readJob(job.id)) throw new Error('job already exists: ' + job.id)
     return commit(null, {
-      ...structuredClone(job), status: 'running', turnId: crypto.randomUUID(),
+      ...structuredClone(job), kind: job.kind || 'chat', status: 'running',
+      turnId: crypto.randomUUID(),
       pid: null, claimedAt: null, createdAt: now(),
+      ...structuredClone(CLEAN_PROVENANCE),
     })
   }
   function beginLocked(id, prompt, files = []) {
@@ -34,11 +48,13 @@ export function makeTurnStore({ readJob, commitLocked, withStoreLock, now = () =
     if (!old) throw new Error('no such job: ' + id)
     if (!terminal(old)) throw new Error('job is not idle: ' + id)
     if (!old.url) throw new Error('job has no conversation URL')
+    if (old.kind === 'dot-send') throw new Error('dot sends have no follow-up; message again with: chatgpt-web dot "text"')
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('empty prompt')
     return commit(old, {
       ...structuredClone(old), turnId: crypto.randomUUID(), status: 'running',
       prompt, files: [...files], reply: null, error: null, pid: null,
       claimedAt: null, createdAt: now(),
+      ...structuredClone(CLEAN_PROVENANCE),
       history: [...(old.history || []), { role: 'user', text: prompt }],
     })
   }
@@ -47,10 +63,16 @@ export function makeTurnStore({ readJob, commitLocked, withStoreLock, now = () =
     if (!old) throw new Error('no such job: ' + id)
     if (!terminal(old)) throw new Error('job is not idle: ' + id)
     if (!old.url) throw new Error('job has no conversation URL')
+    if (old.kind === 'dot-send') throw new Error('dot sends cannot be resumed')
+    // The retry's target is the generation's own accepted prompt, preserved
+    // explicitly instead of leaving stale accepted/final ids on the record.
     return commit(old, {
       ...structuredClone(old), turnId: crypto.randomUUID(), status: 'running',
       reply: null, error: null, pid: null,
       claimedAt: null, createdAt: now(),
+      resumeTargetUserId: old.acceptedUserId || null,
+      resumePreviousAssistantId: old.assistantMessageId || null,
+      ...structuredClone(CLEAN_PROVENANCE),
     })
   }
   function updateLocked(id, turnId, mutate) {

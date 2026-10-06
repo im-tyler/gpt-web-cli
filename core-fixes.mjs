@@ -5,15 +5,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn, execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
+import { positiveInteger, boundedArtifactName } from './audit-core.mjs'
+import { openPrivateLog } from './audit-io.mjs'
 
-export function positiveInteger(raw, label, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
-  const text = String(raw).trim()
-  const value = Number(text)
-  if (!/^\d+$/.test(text) || !Number.isSafeInteger(value) || value < min || value > max) {
-    throw new Error(`${label} must be an integer from ${min} to ${max}`)
-  }
-  return value
-}
+export { positiveInteger }
 
 export function jobId(raw) {
   if (typeof raw !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(raw)) {
@@ -124,7 +119,7 @@ export function spawnStarted(bin, args, { detached = true, stdio = 'ignore' } = 
 // descriptor on every path. Launch failure rejects, so the caller can file
 // the admitted generation as failed instead of leaving a reservation.
 export async function spawnRunnerLogged(nodeBin, script, args, logFile) {
-  const log = fs.openSync(logFile, 'a')
+  const log = openPrivateLog(logFile)
   try {
     const child = await spawnStarted(nodeBin, [script, ...args], { detached: true, stdio: ['ignore', log, log] })
     child.unref()
@@ -141,7 +136,7 @@ export async function spawnRunnerLogged(nodeBin, script, args, logFile) {
 // writes); an exclusive-open collision retries with a fresh suffix rather
 // than failing; symlinked destinations are refused rather than followed.
 export function saveArtifact(dir, name, id, bytes) {
-  const safeBase = String(name || '').replace(/[^A-Za-z0-9._-]/g, '_') || 'file'
+  const safeBase = boundedArtifactName(name)
   const ext = path.extname(safeBase)
   const stem = safeBase.slice(0, safeBase.length - ext.length)
   const idTag = String(id).replace(/[^A-Za-z0-9]/g, '').slice(0, 8)
