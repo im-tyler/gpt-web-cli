@@ -120,62 +120,66 @@ export function openPrivateLog(file) {
 // /api/auth/session on every tick doubled the request cadence (a metronomic
 // tell, and extra 429 pressure). A 401 invalidates the cache and retries
 // once with a fresh session read.
+//
+// Auth-gone is CLASSIFIED, not swallowed (B5): a session endpoint that
+// answers non-2xx, or answers without an accessToken, is a logged-out page
+// — the result carries its status (401 for a token-less 200) and auth: true
+// so callers fail fast with login guidance instead of retrying a dead
+// session to the deadline as generic status 0.
 export async function getBackendJSON(page, urlPath, timeoutMs = 15000) {
   const result = await page
     .evaluate(async ({ urlPath, timeoutMs }) => {
-      try {
-        const readToken = async () => {
-          const cached = window.__cgwBearer
-          if (cached && cached.token && (!cached.exp || cached.exp > Date.now() + 60000)) return cached.token
-          const s = await (
-            await fetch('/api/auth/session', {
-              credentials: 'include',
-              signal: AbortSignal.timeout(timeoutMs),
-            })
-          ).json()
-          const token = s && s.accessToken
-          if (!token) return null
-          let exp = 0
-          try {
-            const seg = String(token).split('.')[1] || ''
-            const b64 = seg.replace(/-/g, '+').replace(/_/g, '/')
-            const payload = JSON.parse(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4)))
-            exp = (Number(payload.exp) || 0) * 1000
-          } catch {}
-          window.__cgwBearer = { token, exp }
-          return token
-        }
-        const call = (token) =>
-          fetch(urlPath, {
-            headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
-            credentials: 'include',
-            signal: AbortSignal.timeout(timeoutMs),
-          })
-        let token = await readToken()
-        if (!token) return { error: 'no access token' }
-        let r = await call(token)
-        if (r.status === 401) {
-          window.__cgwBearer = null
-          token = await readToken()
-          if (!token) return { error: 'no access token' }
-          r = await call(token)
-        }
-        if (!r.ok) return { status: r.status, error: 'http ' + r.status }
-        return { status: r.status, data: await r.json() }
-      } catch (e) {
-        return { error: String((e && e.message) || e) }
+      const authFailure = (status) => ({ error: 'not logged in (session auth failed ' + status + ')', auth: true, status })
+      const readToken = async () => {
+        const cached = window.__cgwBearer
+        if (cached && cached.token && (!cached.exp || cached.exp > Date.now() + 60000)) return { token: cached.token }
+        const sr = await fetch('/api/auth/session', {
+          credentials: 'include',
+          signal: AbortSignal.timeout(timeoutMs),
+        })
+        if (!sr.ok) return authFailure(sr.status || 401)
+        const s = await sr.json().catch(() => null)
+        const token = s && s.accessToken
+        if (!token) return authFailure(401)
+        let exp = 0
+        try {
+          const seg = String(token).split('.')[1] || ''
+          const b64 = seg.replace(/-/g, '+').replace(/_/g, '/')
+          const payload = JSON.parse(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4)))
+          exp = (Number(payload.exp) || 0) * 1000
+        } catch {}
+        window.__cgwBearer = { token, exp }
+        return { token }
       }
+      const call = (token) =>
+        fetch(urlPath, {
+          headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+          credentials: 'include',
+          signal: AbortSignal.timeout(timeoutMs),
+        })
+      let tok = await readToken()
+      if (tok.auth) return tok
+      let r = await call(tok.token)
+      if (r.status === 401) {
+        window.__cgwBearer = null
+        tok = await readToken()
+        if (tok.auth) return tok
+        r = await call(tok.token)
+      }
+      if (!r.ok) return { status: r.status, error: 'http ' + r.status }
+      return { status: r.status, data: await r.json() }
     }, { urlPath, timeoutMs: Math.max(1, timeoutMs) })
     .catch((e) => ({ error: e.message }))
   if (!result || result.error) {
     return {
       ok: false,
-      status: (result && result.status) || 0,
+      status: (result && typeof result.status === 'number' && result.status) || 0,
       data: null,
       error: (result && result.error) || 'page evaluation failed',
+      auth: !!(result && result.auth),
     }
   }
-  return { ok: true, status: result.status, data: result.data, error: null }
+  return { ok: true, status: result.status, data: result.data, error: null, auth: false }
 }
 
 // evaluateBounded races a page.evaluate against a wall-clock bound:
@@ -185,20 +189,57 @@ export async function getBackendJSON(page, urlPath, timeoutMs = 15000) {
 // other CLI process. The losing evaluation settles on its own (its fetches
 // carry abort signals); its eventual rejection is absorbed so it can never
 // surface later as an unhandled one.
-export async function evaluateBounded(page, fn, arg, timeoutMs = 30000, label = 'page evaluation') {
+//
+// B1: for MUTATION evaluations (the delete PATCH loop) a fired bound must
+// not detach a still-running loop — the caller would report failure and
+// release its store lock while the page keeps mutating. Pass `cancel`
+// (sets the in-page stop flag) and `settleMs`: when the bound fires, the
+// cancel is signalled best-effort (itself bounded at 2s) and the
+// evaluation then gets settleMs to return its real per-item outcome. Only
+// an evaluation that ignores both the flag and the settle window rejects.
+export async function evaluateBounded(page, fn, arg, timeoutMs = 30000, label = 'page evaluation', { cancel = null, settleMs = 0 } = {}) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('invalid evaluation timeout')
-  let timer = null
+  const evaluation = page.evaluate(fn, arg)
+  evaluation.catch(() => {})
+  const bounded = async (ms, message) => {
+    let timer = null
+    try {
+      return await Promise.race([
+        evaluation,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const e = new Error(message)
+            e.boundedTimeout = true
+            reject(e)
+          }, ms)
+        }),
+      ])
+    } finally {
+      if (timer !== null) clearTimeout(timer)
+    }
+  }
   try {
-    const evaluation = page.evaluate(fn, arg)
-    evaluation.catch(() => {})
-    return await Promise.race([
-      evaluation,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer !== null) clearTimeout(timer)
+    return await bounded(timeoutMs, `${label} timed out after ${timeoutMs}ms`)
+  } catch (e) {
+    if (!e.boundedTimeout || typeof cancel !== 'function') throw e
+    let cancelTimer = null
+    try {
+      await Promise.race([
+        Promise.resolve(cancel()),
+        new Promise((_, reject) => {
+          cancelTimer = setTimeout(() => reject(new Error('cancel signalling timed out')), 2000)
+        }),
+      ])
+    } catch {
+      // best-effort: a wedged transport cannot hang the cancel; the loop's
+      // own per-fetch aborts still bound it
+    } finally {
+      if (cancelTimer !== null) clearTimeout(cancelTimer)
+    }
+    if (Number.isSafeInteger(settleMs) && settleMs > 0) {
+      return await bounded(settleMs, `${label} timed out after ${timeoutMs}ms (cancel signalled; the page did not settle within ${settleMs}ms)`)
+    }
+    throw e
   }
 }
 
@@ -207,24 +248,38 @@ export async function evaluateBounded(page, fn, arg, timeoutMs = 30000, label = 
 // process error mid-run files an honest terminal record instead of dying
 // silently for the reaper to misdiagnose as "runner died (pid N)" — which
 // invites a blind retry after a dispatch that may already have landed.
-// `file(detail)` persists the error record; filing is watchdog-bounded and
-// the process exits non-zero afterwards. close() removes the handlers on a
-// normal finish.
-export function installInterruptionFence({ file, exitCode = 130 } = {}) {
+// `file(detail)` persists the error record; `cleanup()` (B6) releases
+// resources the normal path would have released — e.g. closing the page
+// the interrupted operation is inside `withPage` with, so the exit cannot
+// leak a stray daemon tab per interrupted send. Both are watchdog-bounded
+// and the process exits non-zero afterwards. close() removes the handlers
+// on a normal finish. interrupt() is the handler body and `exit` the exit
+// function — both injectable for tests.
+export function installInterruptionFence({ file, cleanup = null, exitCode = 130, exit = process.exit } = {}) {
   if (typeof file !== 'function') throw new TypeError('installInterruptionFence needs a file function')
+  if (cleanup !== null && typeof cleanup !== 'function') throw new TypeError('installInterruptionFence cleanup must be a function')
+  if (typeof exit !== 'function') throw new TypeError('installInterruptionFence exit must be a function')
   let closed = false
   let filing = false
   const interrupted = async (why) => {
     if (closed || filing) return
     filing = true
     process.exitCode = exitCode
-    const watchdog = setTimeout(() => process.exit(exitCode), 8000)
+    const watchdog = setTimeout(() => exit(exitCode), 8000)
     if (watchdog.unref) watchdog.unref()
     try {
+      // Stop the in-page work FIRST (B6): no further browser mutation can
+      // race the filing, and the tab is closed before the exit instead of
+      // leaking on the shared daemon.
+      if (typeof cleanup === 'function') {
+        try {
+          await cleanup()
+        } catch {}
+      }
       const detail = why ? String(why).slice(0, 160) : ''
       await file(detail)
     } catch {}
-    process.exit(exitCode)
+    exit(exitCode)
   }
   const onSignal = (signal) => interrupted(signal)
   const onFatal = (reason) => interrupted('fatal: ' + String((reason && reason.message) || reason))
@@ -234,6 +289,7 @@ export function installInterruptionFence({ file, exitCode = 130 } = {}) {
   process.on('unhandledRejection', onFatal)
   process.on('uncaughtException', onFatal)
   return {
+    interrupt: interrupted,
     close() {
       closed = true
       process.off('SIGINT', onSignal)

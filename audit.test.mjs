@@ -31,8 +31,11 @@ import {
   pollBackoffMs,
   collectConversationListing,
   dotSendInterruption,
+  deleteEvalBoundMs,
+  sequentialFetchBoundMs,
+  acceptanceBackoffMs,
 } from './audit-core.mjs'
-import { writeJSONAtomic, readJSONStrict, validateUploads, ARTIFACT_MAX_BYTES } from './audit-io.mjs'
+import { writeJSONAtomic, readJSONStrict, validateUploads, ARTIFACT_MAX_BYTES, evaluateBounded, installInterruptionFence } from './audit-io.mjs'
 import { attachmentVerdict } from './core-fixes.mjs'
 
 // ----- P01: prompt identity -------------------------------------------------
@@ -437,14 +440,97 @@ test('collectConversationListing: exactly-cap inventory is complete, not capped 
 
 // ----- A5: foreground dot-send interruption classification --------------------------
 
-test('dotSendInterruption classifies by dispatch progress, never as a runner crash (A5)', () => {
+test('dotSendInterruption classifies by dispatch progress, never as a runner crash (A5/B6)', () => {
   assert.match(dotSendInterruption('dispatched'), /may have been sent; inspect the dot thread before retrying/)
   assert.match(dotSendInterruption('dispatching'), /may have been sent/, 'the click window counts as uncertain')
-  assert.match(dotSendInterruption('accepted'), /may have been sent/)
   const early = dotSendInterruption(undefined)
   assert.match(early, /nothing was sent; retry is safe/)
   assert.doesNotMatch(early, /runner died/)
   assert.doesNotMatch(dotSendInterruption('dispatched'), /runner died/)
+})
+
+// B6: 'accepted'/'sent' mean the send was VERIFIED (a new API message id
+// with the exact authored text). An interrupt after that point must not
+// re-open the inspect-before-retry question the code already answered.
+test('dotSendInterruption reports verified sends as verified, not uncertain (B6)', () => {
+  for (const state of ['accepted', 'sent']) {
+    const msg = dotSendInterruption(state)
+    assert.match(msg, /verified/, state + ' is a verified send')
+    assert.doesNotMatch(msg, /may have been sent/, state + ' must not claim uncertainty')
+    assert.doesNotMatch(msg, /runner died/)
+  }
+})
+
+// ----- B1: wall-clock bound sizing dominates in-page sequential budgets ------
+
+test('deleteEvalBoundMs dominates the in-page worst case for every target count (B1)', () => {
+  // In-page worst: one 20s session fetch + n × (20s PATCH abort budget +
+// 400ms pacing gap). The bound must clear it with margin (audit spec:
+// ≥ 20000 + n·20400 + 5000).
+  for (let n = 1; n <= 10; n++) {
+    const worst = 20000 + n * 20400
+    assert.ok(
+      deleteEvalBoundMs(n) >= worst + 5000,
+      `n=${n}: bound ${deleteEvalBoundMs(n)} must dominate worst ${worst} + 5000 margin`
+    )
+  }
+  // The undersized HEAD bounds failed exactly these cases.
+  for (const n of [2, 3, 4]) {
+    const headBound = Math.max(60000, n * 25000)
+    assert.ok(deleteEvalBoundMs(n) > headBound, `n=${n}: the fixed bound must exceed the old ${headBound}`)
+    assert.ok(headBound < 20000 + n * 20400, `n=${n}: the old bound was genuinely undersized (test sanity)`)
+  }
+  assert.equal(deleteEvalBoundMs(0), 30000, 'no targets: session + margin')
+})
+
+test('sequentialFetchBoundMs sizes the two-fetch evaluations (B1)', () => {
+  // Chats listing: session + conversations, both 20s-aborted → ≥ 40s work.
+  assert.equal(sequentialFetchBoundMs(2, 20000), 50000)
+  assert.ok(sequentialFetchBoundMs(2, 20000) >= 40000, 'listing bound dominates the 40s in-page worst')
+  // Dot reads: session + target at 15s → ≥ 30s work (old bound was 20s).
+  assert.equal(sequentialFetchBoundMs(2, 15000, 5000), 35000)
+  assert.ok(sequentialFetchBoundMs(2, 15000, 5000) >= 30000, 'dot bound dominates the 30s in-page worst')
+  assert.throws(() => sequentialFetchBoundMs(0), /invalid fetch count/)
+})
+
+test('collectConversationListing routes a REJECTING fetchPage into the honesty channel (B1)', async () => {
+  // evaluateBounded's wall-clock rejection used to bypass chatListingOutcome
+  // and surface as a raw CLI crash; the contract is {error} conversion.
+  const boom = async () => {
+    throw new Error('chats listing page timed out after 50000ms')
+  }
+  const result = await collectConversationListing(boom)
+  assert.deepEqual(result.items, [])
+  assert.match(result.lastError, /timed out after 50000ms/)
+  assert.equal(result.hitCap, false)
+
+  // Same contract for the boundary probe rejection: capped AND errored.
+  let calls = 0
+  const probeBoom = async () => {
+    calls++
+    return calls <= 4 ? { items: Array.from({ length: 50 }, (_, i) => ({ id: 'i' + calls + '-' + i })) } : Promise.reject(new Error('probe timed out'))
+  }
+  const capped = await collectConversationListing(probeBoom)
+  assert.equal(capped.hitCap, true)
+  assert.match(capped.lastError, /probe timed out/)
+})
+
+// ----- B3: acceptance-window backoff keeps the window fed ----------------------
+
+test('acceptanceBackoffMs caps to the window and never grows 404 (B3)', () => {
+  // Any storm, worst-case jittered base: ≥10 consecutive-failure attempts
+  // fit in the window (sum of the first 10 backoffs ≤ 60s).
+  let total = 0
+  for (let n = 1; n <= 10; n++) total += acceptanceBackoffMs(n, 2500, 60000, 429)
+  assert.ok(total <= 60000, `10 attempts must fit a 60s window (sum ${total}ms)`)
+  assert.equal(acceptanceBackoffMs(99, 20000, 60000), 6000, 'cap is window/10')
+  // 404 is the documented indexing delay — time-based, not load-based.
+  assert.equal(acceptanceBackoffMs(7, 1800, 60000, 404), 1800, '404 stays at the base cadence')
+  assert.ok(acceptanceBackoffMs(7, 1800, 60000, 404) < acceptanceBackoffMs(7, 1800, 60000, 429))
+  // Small windows floor the cap at 1s (never hammer, however tiny the
+  // window); big windows never exceed 15s.
+  assert.equal(acceptanceBackoffMs(5, 5000, 3000, 429), 1000)
+  assert.equal(acceptanceBackoffMs(5, 5000, 300000, 429), 15000)
 })
 
 
@@ -569,4 +655,83 @@ test('attachmentVerdict refuses unknown card states instead of guessing ready', 
     ),
     { ok: true }
   )
+})
+
+// ----- B1/B6: audit-io behaviors ---------------------------------------------------
+
+// B1: a fired bound on a CANCELLABLE (mutation) evaluation must not detach
+// the in-page loop — it signals cancel, then lets the evaluation settle so
+// the caller observes the loop's real termination and per-item outcome.
+test('evaluateBounded cancels and settles a slow mutation evaluation instead of detaching it (B1)', async () => {
+  let cancelled = false
+  const page = { evaluate: async (fn, arg) => fn(arg) }
+  const res = await evaluateBounded(
+    page,
+    async () => {
+      // "Loop" that finishes after the bound fires, reporting the flag.
+      await new Promise((r) => setTimeout(r, 120))
+      return { results: [{ id: 'a', ok: true }], cancelled }
+    },
+    null,
+    30,
+    'test mutation loop',
+    {
+      cancel: async () => {
+        cancelled = true
+      },
+      settleMs: 1000,
+    }
+  )
+  assert.equal(res.cancelled, true, 'the evaluation observed the cancel flag')
+  assert.equal(res.results.length, 1, 'the settled value — not a rejection — reached the caller')
+})
+
+// B1: without a cancel hook the old semantics hold — the bound rejects
+// (read-only sites) and the losing evaluation's eventual rejection is
+// absorbed (no unhandled rejection escapes later).
+test('evaluateBounded still rejects at the bound for uncancellable evaluations (B1)', async () => {
+  const page = { evaluate: async (fn, arg) => fn(arg) }
+  await assert.rejects(
+    evaluateBounded(
+      page,
+      async () => {
+        await new Promise((r) => setTimeout(r, 10000))
+        return { late: true }
+      },
+      null,
+      30,
+      'test read'
+    ),
+    /test read timed out after 30ms/
+  )
+})
+
+// B6: the fence runs cleanup (close the page) BEFORE filing and BEFORE the
+// exit — the exit used to fire inside withPage, leaking a stray daemon tab
+// per interrupted dot send.
+test('interruption fence orders cleanup, file, exit — and a terminal record is never overwritten (B6)', async () => {
+  const order = []
+  let releaseExit
+  const exited = new Promise((r) => {
+    releaseExit = r
+  })
+  const fence = installInterruptionFence({
+    cleanup: async () => {
+      await Promise.resolve()
+      order.push('cleanup')
+    },
+    file: async () => {
+      order.push('file')
+    },
+    exit: (code) => {
+      order.push('exit:' + code)
+      releaseExit(code)
+    },
+  })
+  await fence.interrupt('SIGINT')
+  const code = await exited
+  assert.equal(code, 130)
+  assert.deepEqual(order, ['cleanup', 'file', 'exit:130'], 'cleanup strictly precedes filing and exit')
+  fence.close()
+  process.exitCode = 0 // the fence sets it on the real process; tests restore it
 })

@@ -279,6 +279,47 @@ export function pollBackoffMs(consecutive, baseMs, { maxMs = 15000 } = {}) {
   return Math.min(maxMs, Math.round(baseMs * Math.pow(2, n - 1)))
 }
 
+// acceptanceBackoffMs scales the backoff cap to the acceptance window
+// (B3): the global 15s cap starves a fixed 60s window down to ~6 attempts
+// under a consecutive-failure storm, so a send landing at t≈55s was never
+// observed and the turn filed ACCEPTANCE_UNKNOWN. Two adjustments:
+//   - the cap is window/10 (min 1s, still ≤15s): ≥10 consecutive-failure
+//     attempts fit inside any window, whatever the jittered base;
+//   - 404 never grows — it is the documented indexing delay ("conversation
+//     not yet readable after the send"), which is time-based, not
+//     load-based; exponential growth answers the wrong failure mode.
+export function acceptanceBackoffMs(consecutive, baseMs, windowMs, status = null) {
+  const cap = Math.min(15000, Math.max(1000, Math.round(Number(windowMs) / 10)))
+  if (status === 404) return Math.min(baseMs, cap)
+  return pollBackoffMs(consecutive, baseMs, { maxMs: cap })
+}
+
+// ----- wall-clock bound sizing for evaluateBounded (B1) ----------------------
+
+// A wall-clock bound wrapping sequential in-page fetches must dominate the
+// SUM of their per-fetch abort budgets (plus pacing gaps and a margin), or
+// slow-but-successful fetches turn into spurious "timed out" command
+// failures — and on the delete PATCH loop, a fired bound detaches a
+// still-running mutation from the store lock that was supposed to fence it.
+//
+// deleteEvalBoundMs: one session fetch + n × (PATCH + 400ms pacing gap) +
+// margin ⇒ 20400·n + 30000 ms at the shipped budgets (worst case is
+// 20000 + 20400·n; every n ≥ 1 clears it with ≥5s to spare).
+export function deleteEvalBoundMs(targetCount, { sessionMs = 20000, fetchMs = 20000, gapMs = 400, marginMs = 10000 } = {}) {
+  const n = Number.isSafeInteger(targetCount) ? Math.max(0, targetCount) : 0
+  return sessionMs + n * (fetchMs + gapMs) + marginMs
+}
+
+// sequentialFetchBoundMs: `fetchCount` sequential in-page fetches, each
+// abort-bounded at fetchMs, plus margin. The chats listing page is
+// session + conversations (2 × 20s + 10s = 50s, was 30s); dot reads are
+// session + rooms/messages (2 × timeoutMs + 5s, was timeoutMs + 5s).
+export function sequentialFetchBoundMs(fetchCount, fetchMs = 20000, marginMs = 10000) {
+  if (!Number.isSafeInteger(fetchCount) || fetchCount < 1) throw new Error('invalid fetch count')
+  if (!Number.isSafeInteger(fetchMs) || fetchMs <= 0) throw new Error('invalid fetch timeout')
+  return fetchCount * fetchMs + marginMs
+}
+
 // ----- dot checkpoints ------------------------------------------------------
 
 const DOT_BACKFILL_MS = 2000
@@ -367,10 +408,17 @@ export function afterDotSend(current, accepted, prompt, now = Date.now()) {
 // far it got. After dispatch (or during the click window) the message may
 // already have landed: the honest filing says so and asks for inspection
 // before any retry — never the reaper's "runner died", which invites a
-// blind duplicate send.
+// blind duplicate send. 'accepted'/'sent' mean the send was VERIFIED
+// (B6): a new API message id with the exact authored text was already
+// proven, so the filing states that instead of re-opening an inspection
+// question the code has already answered.
 export function dotSendInterruption(submissionState, detail = '') {
+  const verified = ['accepted', 'sent'].includes(submissionState)
   const dispatched = ['dispatching', 'dispatched', 'accepted', 'sent'].includes(submissionState)
   const suffix = detail ? ' (' + detail + ')' : ''
+  if (verified) {
+    return 'dot send was interrupted after the send was verified — the message is on the thread; only the bookkeeping was cut short' + suffix
+  }
   return dispatched
     ? 'dot send interrupted after dispatch — the message may have been sent; inspect the dot thread before retrying' + suffix
     : 'dot send interrupted before dispatch — nothing was sent; retry is safe' + suffix
@@ -419,14 +467,23 @@ export function planDeletion({ items, listingError, hitCap, deleteIds, deleteAll
 // when it is not — one boundary probe decides, instead of reporting every
 // at-cap listing as truncated (which also refused legitimate
 // `chats --delete --all --yes` runs). fetchPage(offset) resolves
-// {items} or {error}; pure so the pagination contract is testable.
+// {items} or {error}; a REJECTING fetchPage (e.g. evaluateBounded's
+// wall-clock bound) is converted into that same {error} channel so the
+// partial-result honesty path sees it instead of crashing the command
+// (B1); pure so the pagination contract is testable.
 export async function collectConversationListing(fetchPage, { limit = 50, cap = 200 } = {}) {
   const items = []
   let lastError = null
   let hitCap = false
   let offset = 0
   for (;;) {
-    const page = await fetchPage(offset)
+    let page
+    try {
+      page = await fetchPage(offset)
+    } catch (e) {
+      lastError = String((e && e.message) || e)
+      break
+    }
     if (!page || page.error) {
       lastError = (page && page.error) || 'listing fetch failed'
       break
@@ -437,7 +494,12 @@ export async function collectConversationListing(fetchPage, { limit = 50, cap = 
     if (items.length >= cap) {
       // Boundary probe. A probe failure is treated as capped AND errored:
       // completeness is unproven, and destructive deletes refuse on either.
-      const probe = await fetchPage(offset + limit)
+      let probe
+      try {
+        probe = await fetchPage(offset + limit)
+      } catch (e) {
+        probe = { error: String((e && e.message) || e) }
+      }
       if (!probe || probe.error) {
         lastError = (probe && probe.error) || 'listing boundary probe failed'
         hitCap = true

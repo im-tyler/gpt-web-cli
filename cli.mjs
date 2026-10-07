@@ -395,16 +395,26 @@ export async function cmdDotMessage(text, deps = {}) {
   if (limErr) throw new Error(limErr)
   const claimed = await turns.claim(admitted.id, admitted.turnId, process.pid)
   if (!claimed) throw new Error('dot-send reservation was superseded before launch')
-  const { runDotSend: liveSend } = await import('./runner.mjs')
-  const send = deps.runDotSend || liveSend
+  const runnerModule = await import('./runner.mjs')
+  const send = deps.runDotSend || runnerModule.runDotSend
   const fence = installInterruptionFence({
     file: async (detail) => {
       const current = readJob(admitted.id)
+      // Verify-before-exit (B6): a generation already terminal (done or
+      // filed) keeps its record — the store's terminal immutability makes
+      // this update a no-op, and the filing skips re-opening a question
+      // the record already answered.
       await turns.update(admitted.id, admitted.turnId, (j) => {
         j.status = 'error'
         j.error = dotSendInterruption(current && current.submissionState, detail)
       })
     },
+    // B6: the exit used to fire inside withPage's callback — page.close(),
+    // the CDP disconnect and the hide pass were all unreachable, leaking a
+    // stray /dots tab on the shared daemon per interrupted send. Closing
+    // the owned page also stops any further in-page mutation before the
+    // record is filed.
+    cleanup: () => runnerModule.abortRunner(new Error('dot send interrupted')),
   })
   try {
     await send(text, { jobId: admitted.id, turnId: admitted.turnId })
@@ -416,11 +426,14 @@ export async function cmdDotMessage(text, deps = {}) {
   } catch (e) {
     // Once dispatch passed, ANY failure is an uncertain-send: the filed
     // error must advise inspection before retrying, never imply nothing
-    // was sent.
+    // was sent. An 'accepted' state is stronger — the send was verified.
     const current = readJob(admitted.id)
-    const dispatched = !!(current && ['dispatching', 'dispatched', 'accepted'].includes(current.submissionState))
+    const verified = !!(current && ['accepted', 'sent'].includes(current.submissionState))
+    const dispatched = !!(current && ['dispatching', 'dispatched'].includes(current.submissionState))
     let message = String(e.message || e)
-    if (dispatched && !/inspect/.test(message)) {
+    if (verified && !/verified/.test(message)) {
+      message += ' — the message was verified as sent before this failure'
+    } else if (dispatched && !/inspect/.test(message)) {
       message += ' — the message may have been sent; inspect the dot thread before retrying'
     }
     await turns.update(admitted.id, admitted.turnId, (j) => {

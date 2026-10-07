@@ -69,3 +69,26 @@ test('cmdDotMessage success marks the generation done=sent (A5)', async () => {
   assert.equal(job.status, 'done')
   assert.equal(job.submissionState, 'sent')
 })
+
+// B6: exit-130 must not race a just-verified send — a generation already
+// marked done (terminal) is never overwritten by the interruption filing
+// (the turn store's terminal immutability), so the fence's update is a
+// documented no-op instead of a resurrection.
+test('a done dot-send generation is not overwritten by an interruption-style filing (B6)', async () => {
+  const cli = await import('./cli.mjs')
+  const jobs = await import('./jobs.mjs')
+  const { dotSendInterruption } = await import('./audit-core.mjs')
+  await cli.cmdDotMessage('done before the signal lands', { runDotSend: async () => {} })
+  const job = jobByPrompt(jobs, 'done before the signal lands')
+  assert.equal(job.status, 'done')
+  assert.equal(job.submissionState, 'sent')
+  // The fence's file() body: classify by the CURRENT record, then update.
+  const updated = await jobs.turns.update(job.id, job.turnId, (j) => {
+    j.status = 'error'
+    j.error = dotSendInterruption('sent')
+  })
+  assert.equal(updated, null, 'the store refused to mutate a terminal generation')
+  const after = jobs.readJob(job.id)
+  assert.equal(after.status, 'done', 'the record still says done')
+  assert.equal(after.error, null)
+})
