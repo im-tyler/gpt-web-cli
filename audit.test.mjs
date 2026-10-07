@@ -11,6 +11,7 @@ import path from 'node:path'
 import {
   canonicalPrompt,
   samePrompt,
+  storedPromptText,
   conversationId,
   conversationUrl,
   conversationSnapshot,
@@ -126,6 +127,30 @@ test('findAcceptedUser requires a NEW id, not just matching text', () => {
   )
   // Strict identity: a whitespace-flattened "match" is not a match.
   assert.equal(findAcceptedUser(before, { priorUserIds: new Set(), prompt: 'deliver  the report please' }), null)
+})
+
+// 2026-10-06 regression, layer 2 (fixture 2026-10-07, smoke conversation
+// 6ac447ea…, message d4bbe119…): the backend autolinks bare URLs in stored
+// user messages — authored "audit https://x" is stored as
+// "audit [https://x](https://x)". Acceptance must revert exactly
+// self-labeled links or every URL prompt files ACCEPTANCE_UNKNOWN after a
+// successful send.
+test('findAcceptedUser accepts the stored autolink form of a URL prompt (fixture d4bbe119)', () => {
+  const authored = 'audit https://github.com/neutron-build/neutron for bugs and reply with one word'
+  const stored =
+    'audit [https://github.com/neutron-build/neutron](https://github.com/neutron-build/neutron) for bugs and reply with one word'
+  const snap = conversationSnapshot(fixture(msg('u1', 'user', stored)))
+  assert.equal(findAcceptedUser(snap, { priorUserIds: new Set(), prompt: authored }).id, 'u1')
+})
+
+test('storedPromptText reverts only self-labeled links', () => {
+  assert.equal(storedPromptText('see [https://x](https://x) end'), 'see https://x end')
+  assert.equal(storedPromptText('see [the repo](https://x) end'), 'see [the repo](https://x) end', 'distinct label stays')
+  assert.equal(storedPromptText('see [](https://x) end'), 'see [](https://x) end', 'empty label is not self-labeled')
+  assert.equal(storedPromptText('a [b](c) and [d](d)'), 'a [b](c) and d', 'only the provable reverts')
+  assert.equal(storedPromptText('no links here'), 'no links here')
+  assert.equal(storedPromptText('parenthesised [x](https://y/(z)) tail'), 'parenthesised [x](https://y/(z)) tail', 'unprovable shape untouched — refusal, not false accept')
+  assert.equal(storedPromptText(null), '')
 })
 
 // HEADLINE 2: reply selection finishing before the answer is done.

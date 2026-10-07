@@ -33,6 +33,7 @@ import {
   AuditError,
   canonicalPrompt,
   samePrompt,
+  storedPromptText,
   conversationId,
   conversationUrl,
   conversationSnapshot,
@@ -578,11 +579,20 @@ export async function sendPromptGuarded(page, { boundUrl, prompt, files = [] }) 
         }
         const composer = composers[0]
         const text = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
-        // Exact authored text, line endings normalized only. Broad
-        // whitespace flattening used to accept a different prompt; a
-        // rendering-level divergence is a real refusal.
-        const actual = String(text).replace(/\r\n/g, '\n')
-        if (actual !== promptText) return { error: 'composer changed before submission', saw: actual.slice(0, 90) }
+        // Whitespace-flattened compare on BOTH sides. The 2026-10
+        // contenteditable renders a paragraph break at the autolink
+        // boundary (live 2026-10-07: held "audit \nhttps://…" for authored
+        // "audit https://…"), and innerText block boundaries are rendering,
+        // not content — token identity is what this guard protects. A
+        // draft clobber is still refused (different tokens); authored
+        // identity is proven AFTER the click by the API acceptance (new id
+        // + exact text). Flattening the authored side too keeps multi-line
+        // prompts comparable (the Oct-4 flattening compared against a
+        // line-preserved prompt, which no multi-line prompt could match).
+        const flat = (s) => String(s).replace(/\s+/g, ' ').trim()
+        if (flat(text) !== flat(promptText)) {
+          return { error: 'composer changed before submission', saw: flat(text).slice(0, 90) }
+        }
         // Attachment evidence at the click boundary (same evaluation — no
         // time-of-check/time-of-use gap). The ComposerLayoutAttachments
         // slot with zero children is the structural empty-state sentinel
@@ -1007,7 +1017,9 @@ export async function runResume(jobId, turnId) {
       }
       // Authorization before the click: the retry target must be this
       // record's stored accepted user id, live on the branch's tip, with
-      // the exact turn prompt.
+      // the exact turn prompt. Stored text goes through the autolink
+      // adapter — the accepted message carries the backend's
+      // self-labeled-link form of any URL in the prompt.
       const target = job.resumeTargetUserId
       if (!target) {
         throw new AuditError(
@@ -1020,7 +1032,7 @@ export async function runResume(jobId, turnId) {
       const before = await fetchConversationMessagesRetrying(page, convIdOf(conversationUrl(job.url)))
       const branchUsers = before.branch.filter((m) => m.role === 'user')
       const latestUser = branchUsers.length ? branchUsers[branchUsers.length - 1] : null
-      if (!latestUser || latestUser.id !== target || !samePrompt(latestUser.text, job.prompt)) {
+      if (!latestUser || latestUser.id !== target || !samePrompt(storedPromptText(latestUser.text), job.prompt)) {
         throw new AuditError('RESUME_NOT_OWNED', "the retry target is not this job's accepted prompt")
       }
       // The exclusion set: an existing answer must not "complete" the retry.
@@ -2481,8 +2493,15 @@ async function sendDotPromptGuarded(page, { dotId, prompt }) {
         }
         const composer = composers[0]
         const text = composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText
-        const actual = String(text).replace(/\r\n/g, '\n')
-        if (actual !== promptText) return { error: 'composer changed before submission', saw: actual.slice(0, 90) }
+        // Same flattened compare as sendPromptGuarded: the dot composer is
+        // the same contenteditable family (the main surface converged to
+        // its markup), so a paragraph break rendered at an autolink
+        // boundary is not a content divergence. Dot acceptance is API-only
+        // (new message id + exact authored text) after the click.
+        const flat = (s) => String(s).replace(/\s+/g, ' ').trim()
+        if (flat(text) !== flat(promptText)) {
+          return { error: 'composer changed before submission', saw: flat(text).slice(0, 90) }
+        }
         // The dot surface has no --file support: the attachment slot must
         // be structurally empty (sentinel with zero children) or chip-free.
         const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement

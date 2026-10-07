@@ -291,6 +291,106 @@ test('sendPromptGuarded keeps drift fatal at the mutation boundary (A4)', async 
   )
 })
 
+// guardPage fakes enough DOM for sendPromptGuarded's in-page evaluation:
+// one visible contenteditable composer holding `held`, an empty structural
+// attachment slot, and one visible enabled Send button that records its
+// click. Mirrors the 2026-10-06 live failure fixture: the composer's
+// innerText renders a paragraph break at the autolink boundary.
+function guardPage(held, { path = '/c/' + CONV } = {}) {
+  let clicked = false
+  const scope = {
+    querySelector: (sel) => (sel.includes('ComposerLayoutAttachments') ? { childElementCount: 0 } : null),
+  }
+  const composer = {
+    tagName: 'DIV',
+    innerText: held,
+    getClientRects: () => [1],
+    closest: () => scope,
+  }
+  const button = {
+    disabled: false,
+    getAttribute: () => null,
+    getClientRects: () => [1],
+    click: () => {
+      clicked = true
+    },
+  }
+  return {
+    clicked: () => clicked,
+    url: () => BOUND,
+    goto: async () => {
+      throw new Error('the guard never navigates')
+    },
+    evaluate: async (fn, arg) => {
+      globalThis.location = { origin: 'https://chatgpt.com', pathname: path }
+      globalThis.getComputedStyle = () => ({ visibility: 'visible' })
+      globalThis.document = {
+        querySelectorAll: (sel) => {
+          if (sel === arg.selectors.composer) return [composer]
+          if (sel === arg.selectors.submit) return [button]
+          if (sel === arg.selectors.messages) return []
+          return []
+        },
+      }
+      try {
+        return await fn(arg)
+      } finally {
+        delete globalThis.location
+        delete globalThis.getComputedStyle
+        delete globalThis.document
+      }
+    },
+  }
+}
+
+// 2026-10-06 regression (4 failed audit sends): the contenteditable renders
+// the first space before an autolinked URL as a paragraph break — held
+// "audit \nhttps://…" for authored "audit https://…". innerText block
+// boundaries are RENDERING, not content; authored identity is proven after
+// the click by the API acceptance (new id + exact text). The guard must
+// click. (Strict line-endings-only compare, restored by pass P, refused all
+// three attempts and nothing was ever sent.)
+test('sendPromptGuarded clicks through a rendered paragraph break at the autolink boundary', async () => {
+  freshHome()
+  const runner = await loadRunner()
+  const prompt = 'audit https://github.com/neutron-build/neutron for bugs and improvements across the framework'
+  const held = 'audit \nhttps://github.com/neutron-build/neutron for bugs and improvements across the framework'
+  const page = guardPage(held)
+  await runner.sendPromptGuarded(page, { boundUrl: BOUND, prompt, files: [] })
+  assert.equal(page.clicked(), true, 'the guard clicked the send button')
+})
+
+// The flattening must not open the hole strict compare closed: a server
+// draft that clobbers the typed prompt with DIFFERENT TOKENS still refuses.
+test('sendPromptGuarded still refuses a different prompt under the flattened compare', async () => {
+  freshHome()
+  const runner = await loadRunner()
+  const page = guardPage('a server-synced draft replaced the typed prompt entirely')
+  await assert.rejects(
+    runner.sendPromptGuarded(page, {
+      boundUrl: BOUND,
+      prompt: 'audit https://github.com/neutron-build/neutron for bugs',
+      files: [],
+    }),
+    /submission guard: composer changed before submission/
+  )
+  assert.equal(page.clicked(), false, 'nothing was clicked')
+})
+
+// Multi-line prompts: the Oct-4 flattening compared the flattened held text
+// against a line-preserved prompt, so a multi-line prompt could never match.
+// Both sides flatten now — an extra blank-line run in the rendering is the
+// same rendering divergence as the autolink break.
+test('sendPromptGuarded flattens both sides for multi-line prompts', async () => {
+  freshHome()
+  const runner = await loadRunner()
+  const prompt = 'first line\nsecond line\n\nnew paragraph with a url https://example.com/x'
+  const held = 'first line\n\nsecond line\n\n\nnew paragraph with a url \nhttps://example.com/x'
+  const page = guardPage(held)
+  await runner.sendPromptGuarded(page, { boundUrl: BOUND, prompt, files: [] })
+  assert.equal(page.clicked(), true, 'the guard clicked the send button')
+})
+
 // B2: the final verification fetch (post-done) gets the poll loops'
 // transient classification — one 429 after a proven-complete answer must
 // not fail the turn; a fatal class (403) still rejects immediately; and

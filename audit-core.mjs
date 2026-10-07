@@ -45,6 +45,24 @@ export function samePrompt(a, b) {
   return canonicalPrompt(a) === canonicalPrompt(b)
 }
 
+// The backend autolinks bare URLs in STORED user messages: authored
+// "audit https://x end" is stored as "audit [https://x](https://x) end"
+// (fixture 2026-10-07, smoke conversation 6ac447ea…, message d4bbe119…:
+// every other byte identical — the paragraph break the composer RENDERS
+// at the autolink boundary is not stored). storedPromptText reverts
+// EXACTLY self-labeled links, where the label equals the target, so an
+// authored link with a distinct label ("see [the repo](https://x)") stays
+// a different prompt, and a link shape the regex cannot prove self-labeled
+// (parens in the target) is left untouched — a refusal, never a false
+// accept. Applied only to STORED text in acceptance comparisons; the
+// authored side is never rewritten. samePrompt itself stays strict. A new
+// storage transformation extends the fixture HERE, not a regex at a call
+// site.
+const SELF_LINK = /\[([^\]]+)\]\(([^()\s]+)\)/g
+export function storedPromptText(s) {
+  return String(s ?? '').replace(SELF_LINK, (whole, label, target) => (label === target ? label : whole))
+}
+
 // ----- conversation identity ----------------------------------------------
 
 const CONV_ID_RE = /^[0-9a-fA-F-]{8,}$/
@@ -139,7 +157,10 @@ export function findAcceptedUser(snapshot, { priorUserIds, prompt } = {}) {
   let hit = null
   for (const m of branch) {
     if (m.role !== 'user' || seen.has(m.id)) continue
-    if (samePrompt(m.text, prompt)) hit = m // newest matching new message wins
+    // Stored text carries the backend's autolink transformation; the
+    // adapter reverts exactly self-labeled links before the strict
+    // compare (see storedPromptText).
+    if (samePrompt(storedPromptText(m.text), prompt)) hit = m // newest matching new message wins
   }
   return hit
 }
