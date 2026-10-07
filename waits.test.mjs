@@ -296,16 +296,17 @@ test('sendPromptGuarded keeps drift fatal at the mutation boundary (A4)', async 
 // attachment slot, and one visible enabled Send button that records its
 // click. Mirrors the 2026-10-06 live failure fixture: the composer's
 // innerText renders a paragraph break at the autolink boundary.
-function guardPage(held, { path = '/c/' + CONV } = {}) {
+function guardPage(held, { path = '/c/' + CONV, emptySlot = true, scopeKnown = true } = {}) {
   let clicked = false
   const scope = {
-    querySelector: (sel) => (sel.includes('ComposerLayoutAttachments') ? { childElementCount: 0 } : null),
+    querySelector: (sel) => (emptySlot && sel.includes('ComposerLayoutAttachments') ? { childElementCount: 0 } : null),
+    querySelectorAll: () => [],
   }
   const composer = {
     tagName: 'DIV',
     innerText: held,
     getClientRects: () => [1],
-    closest: () => scope,
+    closest: () => scopeKnown ? scope : null,
   }
   const button = {
     disabled: false,
@@ -326,7 +327,7 @@ function guardPage(held, { path = '/c/' + CONV } = {}) {
       globalThis.getComputedStyle = () => ({ visibility: 'visible' })
       globalThis.document = {
         querySelectorAll: (sel) => {
-          if (sel === arg.selectors.composer) return [composer]
+          if (sel === arg.selectors.composer || sel === arg.composerSel) return [composer]
           if (sel === arg.selectors.submit) return [button]
           if (sel === arg.selectors.messages) return []
           return []
@@ -519,4 +520,39 @@ test('deletePatchLoopInPage completes without cancellation and reports every id 
     globalThis.fetch = realFetch
     delete globalThis.window
   }
+})
+
+test('sendPromptGuarded refuses unmapped attachment emptiness before clicking (P05)', async () => {
+  freshHome()
+  const runner = await loadRunner()
+  const page = guardPage('question', { emptySlot: false })
+  await assert.rejects(runner.sendPromptGuarded(page, { boundUrl: BOUND, prompt: 'question', files: [] }),
+    /attachment empty-state unrecognized/)
+  assert.equal(page.clicked(), false)
+})
+
+test('readComposerAttachments requires a mapped empty sentinel (P05)', async () => {
+  freshHome()
+  const runner = await loadRunner()
+  assert.deepEqual(await runner.readComposerAttachments(guardPage('question', { emptySlot: false })), { known: false })
+  assert.deepEqual(await runner.readComposerAttachments(guardPage('question')), { known: true, files: [] })
+})
+
+test('dot submit refuses an unknown attachment slot or composer scope (P05)', async () => {
+  freshHome()
+  const runner = await loadRunner()
+  for (const options of [{ emptySlot: false }, { scopeKnown: false }]) {
+    const page = guardPage('question', { path: '/dots/' + CONV, ...options })
+    await assert.rejects(runner.sendDotPromptGuarded(page, { dotId: CONV, prompt: 'question' }),
+      /unrecognized/)
+    assert.equal(page.clicked(), false)
+  }
+})
+
+test('dot submit accepts the mapped empty slot (P05)', async () => {
+  freshHome()
+  const runner = await loadRunner()
+  const page = guardPage('question', { path: '/dots/' + CONV })
+  await runner.sendDotPromptGuarded(page, { dotId: CONV, prompt: 'question' })
+  assert.equal(page.clicked(), true)
 })

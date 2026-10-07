@@ -40,3 +40,8 @@ chatgpt-web status                        # daemon, session, usage vs caps
 - `download` never clobbers: artifacts get id-tagged, collision-suffixed names and pre-existing files or symlinks are refused, not overwritten.
 - `dot` talks to the account's always-on dot (ChatGPT messaging room, not a `/c/<id>` thread): sends are paced, capped turns into the existing thread with API-verified acceptance, replies are read by polling (`--poll` advances a watermark, `--context` never touches it). Dot conversations do not count against ChatGPT usage limits; Work/Codex tasks the dot starts do.
 - `node --test` covers the store, CLI parsing, prompt identity, reply inspection, dot checkpoints, deletion planning and download invariants.
+
+For a valid `wait --json` command, the wait operation writes one JSON result
+to stdout on success or failure. Failures
+include `status: "error"`, `code`, and `error`, and exit with status 1; they do
+not cancel the worker. `--turn` pins the requested generation.

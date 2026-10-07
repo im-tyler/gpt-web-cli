@@ -616,6 +616,7 @@ export async function sendPromptGuarded(page, { boundUrl, prompt, files = [] }) 
           const chips = Array.from(scope.querySelectorAll(selectors.chips)).filter(
             (el) => el.closest('[data-message-author-role]') === null
           )
+          if (chips.length === 0) return { error: 'attachment empty-state unrecognized; refusing submission' }
           names = []
           for (const chip of chips) {
             const name = (chip.innerText || '').trim().split('\n')[0]?.trim() || ''
@@ -850,7 +851,7 @@ export async function waitForReply(page, acceptedUserId, boundUrl, onPartial, ex
 // explicit 'unknown' state: state is NEVER guessed from visible text (a
 // file named "failed.log" is a name, not a verdict), duplicate basenames
 // are kept, and attachmentVerdict refuses what cannot be proven.
-async function readComposerAttachments(page) {
+export async function readComposerAttachments(page) {
   return page
     .evaluate(
       ({ composerSel, selectors }) => {
@@ -870,12 +871,11 @@ async function readComposerAttachments(page) {
           })
           return { known: true, files: names.map((name) => ({ name, state: 'unknown' })) }
         }
-        // No sentinel on this layout: fall back to candidate chips in the
-        // composer scope (presence is evidence; emptiness here is only
-        // "no chips matched", the documented residual).
+        // Candidate chips prove presence; only the mapped slot proves emptiness.
         const chips = Array.from(scope.querySelectorAll(selectors.chips)).filter(
           (el) => el.closest('[data-message-author-role]') === null
         )
+        if (chips.length === 0) return { known: false }
         const names = chips.map((chip) => (chip.innerText || '').trim().split('\n')[0]?.trim() || null)
         return { known: true, files: names.map((name) => ({ name, state: 'unknown' })) }
       },
@@ -2477,7 +2477,7 @@ export async function runDotReset() {
 // enabled Send button in one evaluation, then clicks. The dot composer's
 // submit is button[aria-label="Send"], not #composer-submit-button
 // (verified shape).
-async function sendDotPromptGuarded(page, { dotId, prompt }) {
+export async function sendDotPromptGuarded(page, { dotId, prompt }) {
   const result = await page
     .evaluate(
       ({ wantDot, promptText, selectors }) => {
@@ -2502,14 +2502,13 @@ async function sendDotPromptGuarded(page, { dotId, prompt }) {
         if (flat(text) !== flat(promptText)) {
           return { error: 'composer changed before submission', saw: flat(text).slice(0, 90) }
         }
-        // The dot surface has no --file support: the attachment slot must
-        // be structurally empty (sentinel with zero children) or chip-free.
+        // The dot surface has no --file support; a mapped empty slot is required.
         const scope = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement
-        if (scope) {
-          const container = scope.querySelector(selectors.attachContainer)
-          if (container ? container.childElementCount > 0 : scope.querySelectorAll(selectors.chips).length > 0) {
-            return { error: 'dot attachments are not supported — remove the attachment before sending' }
-          }
+        if (!scope) return { error: 'composer scope unrecognized before submission' }
+        const container = scope.querySelector(selectors.attachContainer)
+        if (!container) return { error: 'attachment empty-state unrecognized; refusing submission' }
+        if (container.childElementCount > 0) {
+          return { error: 'dot attachments are not supported — remove the attachment before sending' }
         }
         const buttons = [...document.querySelectorAll(selectors.submit)].filter(
           (b) => visible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true'

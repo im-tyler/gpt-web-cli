@@ -258,6 +258,23 @@ async function cmdResume(id) {
 // record moving to a newer turn (error → resume/send) is reported as a
 // supersession, never silently answered with the newer turn's reply.
 async function cmdWait(id, timeoutSec, stream, opts = {}) {
+  const context = { turnId: opts.turn ?? null }
+  try {
+    await waitForJob(id, timeoutSec, stream, opts, context)
+  } catch (e) {
+    if (!opts.json) throw e
+    await writeOutput(process.stdout, JSON.stringify({
+      id,
+      turnId: context.turnId,
+      status: 'error',
+      code: e.code ?? 'WAIT_FAILED',
+      error: String(e.message || e),
+    }) + '\n')
+    process.exitCode = 1
+  }
+}
+
+async function waitForJob(id, timeoutSec, stream, opts, context) {
   const timeout = timeoutSec === undefined ? 600000 : positiveInteger(timeoutSec, 'wait seconds', { max: 86400 }) * 1000
   ensureDirs()
   await reapStale()
@@ -267,6 +284,7 @@ async function cmdWait(id, timeoutSec, stream, opts = {}) {
     throw new Error('dot sends have no reply wait — the dot answers on its own horizon; poll: chatgpt-web dot --poll')
   }
   const expectedTurnId = opts.turn || initial.turnId
+  context.turnId = expectedTurnId ?? null
   assertWaitGeneration(initial, expectedTurnId)
   const deadline = Date.now() + timeout
   let nextReap = 0
